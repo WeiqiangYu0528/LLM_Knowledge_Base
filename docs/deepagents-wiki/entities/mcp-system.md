@@ -2,58 +2,151 @@
 
 ## Overview
 
-The MCP system lets the CLI discover and connect Model Context Protocol servers, turning external tool providers into agent-usable tools. It supports user-level and project-level configuration files, plus multiple transport types.
+MCP (Model Context Protocol) allows the CLI to connect to external tool servers and expose their capabilities as first-class LangChain tools available to the agent. The `mcp_tools.py` module owns the full lifecycle: discovering config files, validating server configurations, establishing connections (stdio subprocess or remote SSE/HTTP), and wrapping each discovered MCP tool as a `BaseTool` that the agent graph can call like any built-in tool.
 
-MCP integration extends the default graph with externally hosted tools while preserving local trust decisions and CLI visibility.
+Config files follow the Claude Desktop JSON format. Multiple files from user-level and project-level locations are merged, with later files taking precedence. Stdio servers in project-level configs require explicit trust approval before they are loaded.
 
-In practice, this page should be read as a boundary explanation, not just a file list. MCP System owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [CLI Runtime](cli-runtime.md), [ACP Server](acp-server.md), [Local vs Remote Execution](../concepts/local-vs-remote-execution.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+---
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/cli/deepagents_cli/mcp_tools.py` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `libs/cli/deepagents_cli/server_graph.py`, `libs/cli/deepagents_cli/mcp_trust.py` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | MCP config discovery, validation, and tool loading; Server-mode MCP preload and integration; Trust-policy helpers for project MCP |
-| Extension or policy points | The main extension or gating surfaces live around `libs/cli/deepagents_cli/mcp_tools.py`, `libs/cli/deepagents_cli/mcp_trust.py`. |
-| Persistent effects | Server-mode MCP preload and integration |
+### MCP config schema
+
+Config files must contain a top-level `mcpServers` key mapping server names to server config objects. Three transport types are supported:
+
+```json
+{
+  "mcpServers": {
+    "my-stdio-server": {
+      "command": "npx",
+      "args": ["-y", "@my-org/mcp-server"],
+      "env": { "API_KEY": "..." }
+    },
+    "my-sse-server": {
+      "type": "sse",
+      "url": "https://my-mcp-host.example.com/sse",
+      "headers": { "Authorization": "Bearer ..." }
+    },
+    "my-http-server": {
+      "type": "http",
+      "url": "https://my-mcp-host.example.com/mcp"
+    }
+  }
+}
+```
+
+The `type` (or `transport`) field defaults to `"stdio"` when omitted. stdio servers require `command` (string) and accept optional `args` (list) and `env` (dict). SSE and HTTP servers require `url` (string) and accept optional `headers` (dict).
+
+The project root `.mcp.json` example from the repo:
+
+```json
+{
+  "mcpServers": {
+    "docs-langchain": {
+      "type": "http",
+      "url": "https://docs.langchain.com/mcp"
+    },
+    "reference-langchain": {
+      "type": "http",
+      "url": "https://reference.langchain.com/mcp"
+    }
+  }
+}
+```
+
+### `MCPServerInfo` and `MCPToolInfo`
+
+Lightweight dataclasses returned alongside the loaded tools. `MCPServerInfo` captures the server name, transport type, and a list of `MCPToolInfo` entries (name and description for each tool). These are used by the CLI to display which MCP servers and tools are active in the current session.
+
+### Config discovery — `discover_mcp_configs()`
+
+Auto-discovers `.mcp.json` files from three locations in lowest-to-highest precedence order:
+
+1. `~/.deepagents/.mcp.json` — user-level global config, always trusted
+2. `<project-root>/.deepagents/.mcp.json` — project subdir config
+3. `<project-root>/.mcp.json` — project root config (Claude Code compatible)
+
+Project root is resolved from the `ProjectContext` when provided, otherwise via `find_project_root()`, falling back to `cwd`. All discovered files are merged by `merge_mcp_configs()`, with later (higher-precedence) entries overriding earlier ones when server names collide.
+
+### Trust gating for project stdio servers
+
+User-level configs are loaded without restriction. Project-level configs that contain stdio servers are subject to trust gating controlled by the `trust_project_mcp` parameter in `resolve_and_load_mcp_tools()`:
+
+- `True`: all project stdio servers are allowed (flag or prompt approved)
+- `False`: stdio servers are filtered out; remote-only (SSE/HTTP) servers in the same file are still loaded
+- `None` (default): the persistent trust store is checked; fingerprint match allows, otherwise stdio servers are filtered with a warning
+
+Remote-only project configs (no stdio servers) are always loaded without trust gating.
+
+### Pre-flight health checks
+
+Before opening sessions, `_load_tools_from_config()` runs transport-specific checks:
+
+- **stdio**: `shutil.which(command)` — raises `RuntimeError` if the command is not on `PATH`
+- **SSE/HTTP**: a lightweight `HEAD` request with a 2-second timeout — raises `RuntimeError` on DNS failure, connection refused, or timeout; HTTP 4xx/5xx responses are not treated as failures
+
+All preflight errors are collected and reported together before any session is opened.
+
+### Tool loading and naming
+
+After connections are established, `load_mcp_tools(session, server_name=..., tool_name_prefix=True)` from `langchain-mcp-adapters` is called per server. Setting `tool_name_prefix=True` prepends the server name to each tool name, creating namespaced tool identifiers (e.g., `docs-langchain__search`). This prevents collisions when multiple MCP servers expose tools with the same base name.
+
+The resulting `BaseTool` objects are appended to the agent's tool list alongside built-in tools.
+
+### `MCPSessionManager`
+
+Wraps an `AsyncExitStack` that keeps all stdio subprocess sessions alive across tool calls. Without persistent sessions, each stdio tool call would restart the subprocess, losing any in-process server state. `MCPSessionManager.cleanup()` must be called when the CLI session ends to terminate all child processes.
+
+### Error handling
+
+`load_mcp_config()` raises on invalid JSON, missing `mcpServers` key, empty server list, or invalid field types. The lenient wrapper `load_mcp_config_lenient()` used during auto-discovery returns `None` and logs a warning instead of raising, so a broken user-level config does not block session startup.
+
+Tool-load failures (e.g., MCP server crashes during handshake) raise `RuntimeError` with a diagnostic message distinguishing stdio from SSE/HTTP causes. The manager's exit stack is closed before re-raising to avoid orphaned processes.
+
+---
 
 ## Architecture
 
-MCP System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/cli/deepagents_cli/mcp_tools.py`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Server connection lifecycle
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+```
+discover_mcp_configs()
+  → merge_mcp_configs()
+    → trust-gate stdio servers
+      → _load_tools_from_config()
+          → preflight checks (PATH / HEAD request)
+          → MultiServerMCPClient(connections)
+          → per-server: client.session(name) → load_mcp_tools()
+          → return (tools, MCPSessionManager, server_infos)
+```
 
-For implementers, the important question is not only what MCP System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+The `MCPSessionManager` holds the `AsyncExitStack` that keeps all sessions open. The CLI registers `manager.cleanup()` to run at session teardown.
 
-## Runtime Behavior
+### Tool naming / namespacing
 
-1. `deepagents_cli/mcp_tools.py` becomes relevant when mCP config discovery, validation, and tool loading.
-2. `deepagents_cli/server_graph.py` becomes relevant when server-mode MCP preload and integration.
-3. `deepagents_cli/mcp_trust.py` becomes relevant when trust-policy helpers for project MCP.
+Each tool name is `<server_name>__<tool_name>` (double underscore separator applied by `langchain-mcp-adapters` when `tool_name_prefix=True`). The agent sees these alongside built-in tools. No renaming or aliasing is applied after loading — the prefix is the canonical name throughout the agent's tool list.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+### Integration into the agent tool list
 
-## Variants, Boundaries, and Failure Modes
+`resolve_and_load_mcp_tools()` is called by the CLI runtime before `create_deep_agent()`. The returned `tools` list is concatenated with any user-supplied tools and passed to `create_deep_agent(tools=[...])`. MCP tools are indistinguishable from built-in tools at the graph level — they are all `BaseTool` instances registered in the same tool node.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+The `no_mcp=True` flag short-circuits the entire system and returns an empty tool list, suitable for `--no-mcp` CLI flag support.
 
-The main extension and failure surfaces are concentrated around `libs/cli/deepagents_cli/mcp_tools.py`, `libs/cli/deepagents_cli/mcp_trust.py`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+---
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `libs/cli/deepagents_cli/mcp_tools.py` | MCP config discovery, validation, and tool loading |
-| `libs/cli/deepagents_cli/server_graph.py` | Server-mode MCP preload and integration |
-| `libs/cli/deepagents_cli/mcp_trust.py` | Trust-policy helpers for project MCP |
+|---|---|
+| `libs/cli/deepagents_cli/mcp_tools.py` | Config loading and validation, auto-discovery, transport-specific health checks, `MultiServerMCPClient` setup, `MCPSessionManager`, tool loading and namespacing |
+| `libs/cli/deepagents_cli/mcp_trust.py` | Persistent trust store for project-level stdio servers |
+| `libs/cli/deepagents_cli/server_graph.py` | Server-mode MCP preload and integration (ACP server path) |
+| `.mcp.json` (repo root) | Example project-level MCP config with two HTTP servers |
+
+---
 
 ## See Also
 
 - [CLI Runtime](cli-runtime.md)
-- [ACP Server](acp-server.md)
-- [Local vs Remote Execution](../concepts/local-vs-remote-execution.md)
-- [SDK to CLI Composition](../syntheses/sdk-to-cli-composition.md)
+- [Skills System](skills-system.md)
 - [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

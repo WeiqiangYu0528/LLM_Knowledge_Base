@@ -2,55 +2,133 @@
 
 ## Overview
 
-The memory system loads persistent context from one or more `AGENTS.md` files and injects that material into the system prompt. Unlike skills, which are demand-loaded workflows, memory is always present once configured.
+`MemoryMiddleware` loads `AGENTS.md` files from the filesystem and injects their content as persistent memory into the agent's system prompt. Unlike skills (which are demand-loaded workflows), memory is always present for the duration of an agent run once configured.
 
-Memory files give the agent a persistent instruction surface that stays outside the immediate conversation transcript.
+This is the primary mechanism for per-project context: each project can ship an `AGENTS.md` file containing build commands, code conventions, architecture notes, or any other information the agent should always have available — without requiring those instructions to appear in the conversation transcript.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Memory System owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [Skills System](skills-system.md), [CLI Runtime](cli-runtime.md), [Filesystem First Agent Configuration](../concepts/filesystem-first-agent-configuration.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+The middleware implements the [agents.md](https://agents.md/) specification.
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/deepagents/deepagents/middleware/memory.py` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `deepagents/AGENTS.md`, `examples/content-builder-agent/AGENTS.md` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Memory source loading, formatting, and prompt injection; Monorepo development memory/instructions for contributors; Example of project-local persistent memory |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | Example of project-local persistent memory |
+### `MemoryMiddleware`
+
+Defined in `libs/deepagents/deepagents/middleware/memory.py`.
+
+Constructor parameters:
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `backend` | `BackendProtocol | BackendFactory` | Required. Used to read files from the filesystem (or remote backend). A factory function is supported for `StateBackend`. |
+| `sources` | `list[str]` | Required. Ordered list of paths to `AGENTS.md` files. Paths are loaded in order; later entries appear after earlier ones in the injected prompt. Tilde (`~`) expansion and relative paths are resolved by the backend. |
+
+### `MemoryState` (AgentState extension)
+
+`MemoryMiddleware` declares a `state_schema = MemoryState` with a single additional field:
+
+```python
+memory_contents: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
+```
+
+`memory_contents` maps each source path to its loaded file content. The `PrivateStateAttr` annotation marks it as internal state — it is not included in the final agent state returned to the caller, and it is automatically excluded from sub-agent state so child agents load their own memory independently.
+
+### How AGENTS.md Files Are Discovered
+
+Sources are **explicit paths** passed to `MemoryMiddleware` at construction time. There is no automatic directory walk. Typical usage in the CLI configures two sources:
+
+1. **User-level**: `~/.deepagents/AGENTS.md` — personal preferences and tool credentials that apply across all projects.
+2. **Project-level**: `./.deepagents/AGENTS.md` — project-specific context committed alongside the codebase.
+
+The CLI's `create_agent_from_config()` wires these paths based on the resolved user and project config directories. Additional sources can be added for monorepo scenarios (e.g., a workspace-level file).
+
+Missing files are silently skipped (`file_not_found` errors are ignored). Any other backend error raises `ValueError`.
+
+### Memory Format Conventions
+
+`AGENTS.md` files are standard Markdown with no required structure. Common sections include:
+
+- **Project overview**: purpose, tech stack, key dependencies
+- **Build and test commands**: exact commands to run tests, lint, build
+- **Code style guidelines**: naming conventions, formatting rules
+- **Architecture notes**: important patterns, boundaries, gotchas
+- **Tool usage hints**: how to use project-specific tools or workflows
+
+The agent is instructed to update these files via `edit_file` when it learns new preferences or receives corrections from the user.
+
+### Memory Injection Format
+
+Loaded content is formatted by `_format_agent_memory()` and wrapped in the `MEMORY_SYSTEM_PROMPT` template:
+
+```
+<agent_memory>
+{path1}
+{content1}
+
+{path2}
+{content2}
+</agent_memory>
+
+<memory_guidelines>
+  ... instructions on when and how to update memory ...
+</memory_guidelines>
+```
+
+Each source is rendered as its path followed by its content, in declaration order. Sources with no content (empty file or not found) are omitted. If no sources have content, the block reads `(No memory loaded)`.
+
+The `<memory_guidelines>` section instructs the agent to:
+- Write back to memory immediately when learning new user preferences, corrections, or required context for tool use.
+- Ask the user rather than assuming when context is missing.
+- Never store credentials or API keys in memory files.
 
 ## Architecture
 
-Memory System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/deepagents/deepagents/middleware/memory.py`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Discovery → Loading → Injection Flow
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+```
+Agent run starts
+  → MemoryMiddleware.before_agent() (or abefore_agent())
+      - skips if memory_contents already in state (idempotent)
+      - calls backend.download_files(sources)   # batch read
+      - ignores file_not_found; raises on other errors
+      - stores {path: content} dict in state as memory_contents
+                                (PrivateStateAttr — not exposed externally)
 
-For implementers, the important question is not only what Memory System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+Each model call
+  → MemoryMiddleware.wrap_model_call() (or awrap_model_call())
+      - calls modify_request(request)
+          - reads memory_contents from request.state
+          - formats via _format_agent_memory()
+          - appends formatted block to system message via append_to_system_message()
+      - forwards modified request to model handler
+```
 
-## Runtime Behavior
+Memory is loaded once at `before_agent` and re-injected on every model call within the run. The load is skipped on subsequent turns because `memory_contents` is already in state.
 
-1. `middleware/memory.py` becomes relevant when memory source loading, formatting, and prompt injection.
-2. `deepagents/AGENTS.md` becomes relevant when monorepo development memory/instructions for contributors.
-3. `content-builder-agent/AGENTS.md` becomes relevant when example of project-local persistent memory.
+### Multiple Sources and Ordering
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+When multiple sources are configured:
 
-## Variants, Boundaries, and Failure Modes
+1. Sources are fetched in a single `download_files()` batch call (or `adownload_files()` for async).
+2. Content is assembled in the order sources were declared in the constructor.
+3. Each source's path is shown as a header above its content, so the agent knows where each piece of memory came from.
+4. Later sources appear after earlier ones — project-level memory appears after user-level memory when the conventional two-source pattern is used.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+There is no merging or deduplication of content across sources. All content from all sources is concatenated in order.
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Live Updates
+
+When the agent writes to an `AGENTS.md` file via `edit_file`, the change is not reflected in the current turn's system prompt (memory was already loaded at `before_agent`). The updated content will be present on the next agent run, since `before_agent` only skips the load when `memory_contents` is already in state — a fresh run starts with an empty state.
 
 ## Source Files
 
 | File | Purpose |
 | --- | --- |
-| `libs/deepagents/deepagents/middleware/memory.py` | Memory source loading, formatting, and prompt injection |
-| `deepagents/AGENTS.md` | Monorepo development memory/instructions for contributors |
-| `examples/content-builder-agent/AGENTS.md` | Example of project-local persistent memory |
+| `libs/deepagents/deepagents/middleware/memory.py` | `MemoryState`, `MemoryMiddleware`, `_format_agent_memory()`, `MEMORY_SYSTEM_PROMPT` |
+| `libs/cli/deepagents_cli/local_context.py` | CLI middleware that injects git state and project structure; wired alongside `MemoryMiddleware` in the CLI agent factory |
 
 ## See Also
 
 - [Skills System](skills-system.md)
+- [Subagent System](subagent-system.md)
 - [CLI Runtime](cli-runtime.md)
 - [Filesystem First Agent Configuration](../concepts/filesystem-first-agent-configuration.md)
 - [Agent Customization Surface](../syntheses/agent-customization-surface.md)

@@ -2,59 +2,151 @@
 
 ## Overview
 
-Session persistence is the CLI's answer to "resume where I left off." It stores thread metadata and checkpointed conversation state in SQLite, surfaces thread listings, and caches derived metadata like message counts and initial prompts for quick UI access.
+Session persistence allows agent conversations to survive process restarts by checkpointing the full graph state between steps. Two backends implement persistent storage from different angles: `FilesystemBackend` writes agent-visible files directly to local disk, and `StoreBackend` stores agent-visible files in LangGraph's `BaseStore` for persistent, cross-thread access. Separately, the `checkpointer` parameter in `create_deep_agent()` controls LangGraph's own graph-state checkpointing (messages, tool call history, and in-flight state), which is what enables a session to be resumed by thread ID after a process restart.
 
-Thread recovery matters because the CLI is expected to behave like a long-lived coding assistant rather than a stateless command runner.
+These two concerns — file storage persistence and graph-state checkpointing — are distinct but complementary. A typical long-running CLI session uses a LangGraph `checkpointer` for state resumption and `FilesystemBackend` for file I/O; a server deployment might combine `StoreBackend` (cross-thread file persistence) with a database-backed LangGraph checkpointer.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Session Persistence owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [CLI Textual UI](cli-textual-ui.md), [CLI Runtime](cli-runtime.md), [Context Management and Summarization](../concepts/context-management-and-summarization.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+---
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/cli/deepagents_cli/sessions.py` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `libs/deepagents/deepagents/middleware/summarization.py`, `libs/cli/deepagents_cli/_session_stats.py` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | SQLite thread metadata, caches, and helper formatting; Writes offloaded conversation history that complements persisted state; UI-facing session metrics and status rendering |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | SQLite thread metadata, caches, and helper formatting; Writes offloaded conversation history that complements persisted state; UI-facing session metrics and status rendering |
+### `FilesystemBackend` — agent files on local disk
+
+`FilesystemBackend` implements `BackendProtocol` and performs all file I/O (read, write, edit, ls, glob, grep) directly against the real filesystem. Files are not serialized into graph state — they exist as ordinary files on disk. This makes them implicitly persistent: files written in one session survive process restart and are visible in the next.
+
+```python
+class FilesystemBackend(BackendProtocol):
+    def __init__(
+        self,
+        root_dir: str | Path | None = None,
+        virtual_mode: bool | None = None,
+        max_file_size_mb: int = 10,
+    ): ...
+```
+
+- `root_dir`: Base directory for all file operations. Defaults to `cwd`. Relative paths are resolved against it.
+- `virtual_mode=False` (default): Agents can reach any accessible path, including absolute paths and `..` traversal. No security boundary is enforced.
+- `virtual_mode=True`: All paths are treated as virtual paths anchored to `root_dir`. Path traversal (`..`, `~`) and absolute paths outside `root_dir` raise `ValueError`. Primarily intended for `CompositeBackend` path-routing semantics, not as a process-level sandbox.
+- `max_file_size_mb`: Files larger than this are skipped during grep's Python fallback search.
+
+Content is read and written as plain text. Timestamps (`created_at`, `modified_at`) are derived from filesystem `stat()` metadata. There is no internal file format — the on-disk file is the canonical representation.
+
+### `StoreBackend` — agent files in LangGraph's BaseStore
+
+`StoreBackend` implements `BackendProtocol` by storing agent-visible files in LangGraph's `BaseStore`. Files persist across conversation threads (not just within a single thread's checkpoints) and are organized by namespace tuples.
+
+```python
+class StoreBackend(BackendProtocol):
+    def __init__(
+        self,
+        store: BaseStore | None = None,
+        namespace: NamespaceFactory | None = None,
+        file_format: FileFormat = "v2",
+    ): ...
+```
+
+- `store`: Optional `BaseStore` instance. When `None`, the store is obtained at call time via `get_store()` from the LangGraph execution context. Requires `store=my_store` to be passed to `create_deep_agent()`.
+- `namespace`: A callable `(BackendContext) -> tuple[str, ...]` that returns the namespace tuple used for all store operations. Namespace components must be alphanumeric with hyphens, underscores, dots, `@`, `+`, colons, or tildes. Wildcards are rejected. Example: `lambda ctx: ("filesystem", ctx.runtime.context.user_id)`.
+- `file_format`: `"v2"` (default) stores content as a plain `str` with an `encoding` field. Legacy `"v1"` stored content as `list[str]` (lines split on `\n`) and is accepted for backward compatibility.
+
+File data is stored in the LangGraph store as items keyed by filename within the namespace. Each item's value is a dict with `content`, `encoding`, and optional `created_at`/`modified_at` ISO 8601 strings.
+
+### `BackendContext` and `NamespaceFactory`
+
+```python
+@dataclass
+class BackendContext(Generic[StateT, ContextT]):
+    state: StateT
+    runtime: Runtime[ContextT]
+
+NamespaceFactory = Callable[[BackendContext[Any, Any]], tuple[str, ...]]
+```
+
+The `NamespaceFactory` gives `StoreBackend` full flexibility over namespace resolution. It is called at each store operation, receiving the current graph state and runtime context. This allows namespaces to be scoped to users, assistants, or any other runtime-derived attribute.
+
+### `checkpointer` parameter in `create_deep_agent()`
+
+```python
+def create_deep_agent(
+    ...
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    ...
+) -> CompiledStateGraph: ...
+```
+
+`checkpointer` is a LangGraph `Checkpointer` instance (e.g., `MemorySaver`, `SqliteSaver`, `PostgresSaver`) that snapshots the full graph state — messages, pending tool calls, and all state channels — after each step. When a `checkpointer` is provided, any invocation that passes a `thread_id` in config can resume a previous conversation:
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+agent = create_deep_agent(
+    model="claude-sonnet-4-6",
+    checkpointer=MemorySaver(),
+)
+
+# First run
+agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": "session-abc"}})
+
+# Resume after restart — graph state is restored from the checkpointer
+agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": "session-abc"}})
+```
+
+`checkpointer` is passed through to LangGraph's `StateGraph.compile()` unchanged. Without a checkpointer, each invocation starts from a blank state regardless of `thread_id`.
+
+### Session IDs and thread IDs
+
+LangGraph identifies conversations by `thread_id` passed in the invocation config under `config["configurable"]["thread_id"]`. The thread ID is a caller-supplied string (typically a UUID). The checkpointer stores one snapshot per `(thread_id, checkpoint_ns, checkpoint_id)` tuple; the latest checkpoint for a thread is used on resume.
+
+The CLI generates a `thread_id` UUID at session creation time, stores it in its SQLite session metadata table, and passes it on every invocation for the lifetime of that CLI session. This allows the CLI's session-resume UI to map a human-readable session name back to a LangGraph thread ID.
+
+---
 
 ## Architecture
 
-Session Persistence is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/cli/deepagents_cli/sessions.py`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Save / restore flow
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+```
+agent.invoke(messages, config={"configurable": {"thread_id": "..."}})
+  → LangGraph step loop
+      → after each node: checkpointer.put(checkpoint)
+      → tool calls: backend.write() / backend.edit() / ...
+          FilesystemBackend → disk I/O (file persists immediately)
+          StoreBackend      → store.put(namespace, key, value)
+  → on next invoke with same thread_id:
+      → checkpointer.get(thread_id) → restore AgentState
+      → FilesystemBackend: files already on disk, no restore needed
+      → StoreBackend: files fetched from store on demand per tool call
+```
 
-For implementers, the important question is not only what Session Persistence does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+### What state is persisted
 
-## Runtime Behavior
+| Layer | Mechanism | Scope |
+|---|---|---|
+| Graph state (messages, tool history, state channels) | LangGraph `checkpointer` | Per thread, restored on resume |
+| Agent-visible files (`FilesystemBackend`) | Filesystem — no explicit save/restore | Persist naturally on disk across all threads and restarts |
+| Agent-visible files (`StoreBackend`) | LangGraph `BaseStore` per namespace | Persistent across threads; namespace-scoped |
+| Agent-visible files (`StateBackend`) | LangGraph state channel `files` | Per thread only; restored via checkpointer alongside messages |
 
-1. `deepagents_cli/sessions.py` becomes relevant when sQLite thread metadata, caches, and helper formatting.
-2. `middleware/summarization.py` becomes relevant when writes offloaded conversation history that complements persisted state.
-3. `deepagents_cli/_session_stats.py` becomes relevant when uI-facing session metrics and status rendering.
+### `StoreBackend` vs `checkpointer` — two independent persistence axes
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+`StoreBackend` and `checkpointer` operate independently and serve different purposes. The checkpointer is about replaying graph execution from a known state. `StoreBackend` is about giving the agent access to files that outlive any single thread. Both can be used together: a checkpointer resumes the conversation; `StoreBackend` ensures that files the agent wrote in a previous thread are still readable.
 
-## Variants, Boundaries, and Failure Modes
-
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
-
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+---
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `libs/cli/deepagents_cli/sessions.py` | SQLite thread metadata, caches, and helper formatting |
-| `libs/deepagents/deepagents/middleware/summarization.py` | Writes offloaded conversation history that complements persisted state |
-| `libs/cli/deepagents_cli/_session_stats.py` | UI-facing session metrics and status rendering |
+|---|---|
+| `libs/deepagents/deepagents/backends/filesystem.py` | `FilesystemBackend` — direct disk I/O with optional virtual path mode and security notes |
+| `libs/deepagents/deepagents/backends/store.py` | `StoreBackend`, `BackendContext`, `NamespaceFactory` — persistent cross-thread file storage via LangGraph `BaseStore` |
+| `libs/deepagents/deepagents/graph.py` | `create_deep_agent()` — `checkpointer` and `store` parameters; passes both to `StateGraph.compile()` |
+| `libs/deepagents/deepagents/backends/protocol.py` | `BackendProtocol`, `FileData`, and all result types shared by both backends |
+
+---
 
 ## See Also
 
-- [CLI Textual UI](cli-textual-ui.md)
-- [CLI Runtime](cli-runtime.md)
-- [Context Management and Summarization](../concepts/context-management-and-summarization.md)
-- [Interactive Session Lifecycle](../syntheses/interactive-session-lifecycle.md)
-- [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md)
-- [Sdk To Cli Composition](../syntheses/sdk-to-cli-composition.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Backend System](backend-system.md)
+- [Graph Factory](graph-factory.md)
+- [Filesystem First Agent Configuration](../concepts/filesystem-first-agent-configuration.md)

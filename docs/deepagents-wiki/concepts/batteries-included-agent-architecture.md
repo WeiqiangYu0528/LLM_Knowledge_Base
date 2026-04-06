@@ -1,72 +1,156 @@
-# Batteries Included Agent Architecture
+# Batteries-Included Agent Architecture
 
 ## Overview
 
-Deep Agents is built around the idea that useful agent behavior should not require each user to independently discover the same stack. The project therefore bundles planning, filesystem access, shell execution, subagent delegation, and prompt guidance as defaults.
+deepagents is described in its own README as "the batteries-included agent harness." This means that calling `create_deep_agent()` with no arguments produces a fully functional agent — one with planning, filesystem access, context management, subagent delegation, prompt caching, and memory — without the user wiring up any of that infrastructure.
 
-This concept is easier to understand when read as a runtime guarantee rather than a marketing phrase: it describes how Deep Agents keeps customization and execution coherent across SDK, CLI, and remote backends. Batteries Included Agent Architecture is therefore best read as a mechanism with operational consequences, not merely a label for related features.
-
-## Why It Exists
-
-This concept exists because the Deep Agents codebase repeatedly needs a stable way to coordinate behavior across multiple entities without turning those entities into one monolith.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In Deep Agents, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In Deep Agents, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In Deep Agents, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In Deep Agents, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
+The middleware-first design is the mechanism that makes this possible. Every capability is delivered as a discrete layer in a composable middleware stack, and the default stack is pre-assembled inside `create_deep_agent()`. Users extend the agent by appending to `middleware=` or passing `tools=`; they do not replace what already works.
 
 ## Mechanism
 
-A useful way to read this mechanism is as an ordered path through the participating subsystems:
-1. a default model and base system prompt.
-2. planning support through todo middleware.
-3. filesystem and execution tooling.
-4. subagent support through the `task` tool.
-5. summarization and patching middleware.
-6. optional skills and memory layers.
-7. The pattern is most explicit in `create_deep_agent`, which assembles: 1.
-8. a default model and base system prompt 2.
-9. planning support through todo middleware 3.
-10. filesystem and execution tooling 4.
+`create_deep_agent()` builds two parallel middleware stacks — one for the main agent and one for each subagent — then hands them to LangGraph's `create_agent()`.
 
-The steps above are the operational skeleton. The exact file names vary by subsystem, but the concept remains stable because each participating entity contributes one predictable part of the chain. That is why the same concept can show up in SDK code, CLI wiring, plugin activation, channel routing, or persistence without becoming ambiguous.
+### Main agent middleware assembly order
 
-## Invariants and Operational Implications
+The stack is assembled in `graph.py`. The order determines both the tool registration order and the model-call wrapping order (outermost middleware wraps innermost):
 
-The most important invariant is that the linked entities are allowed to change implementation detail without changing the high-level guarantee described here. When a change breaks that guarantee, the failure usually appears at subsystem boundaries first: a summary no longer compacts correctly, a session route stops being stable, a skill path is not loaded consistently, or a permission rule is evaluated in the wrong layer.
+```python
+# libs/deepagents/deepagents/graph.py  (lines 292–322)
 
-Operationally, this means debugging should follow the mechanism rather than a UI symptom. Start where the concept is introduced, then inspect the next boundary where data, policy, or control is handed off. The source evidence table below is organized to support exactly that style of investigation.
+deepagent_middleware: list[AgentMiddleware] = [
+    TodoListMiddleware(),                                          # 1. Planning
+]
+# SkillsMiddleware inserted here when skills= is set             # 2. Skills (optional)
+deepagent_middleware.extend([
+    FilesystemMiddleware(backend=backend),                        # 3. File + shell tools
+    SubAgentMiddleware(backend=backend, subagents=inline_subagents),  # 4. task tool
+    create_summarization_middleware(model, backend),              # 5. Auto-summarization
+    PatchToolCallsMiddleware(),                                   # 6. Tool-call normalization
+])
+# AsyncSubAgentMiddleware appended when async subagents present  # 7. Async delegation
+# ── user middleware inserted here via middleware= param ──      # 8. User extensions
+deepagent_middleware.append(
+    AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")  # 9. Prompt caching
+)
+# MemoryMiddleware appended when memory= is set                  # 10. Memory (optional)
+# HumanInTheLoopMiddleware appended when interrupt_on= is set   # 11. HITL (conditional)
+```
+
+The comment in the source is explicit about why caching and memory come last:
+
+```python
+# Caching + memory after all other middleware so memory updates don't
+# invalidate the Anthropic prompt cache prefix.
+```
+
+### What each layer contributes
+
+Each middleware layer can independently:
+- **Add tools** — expose new `BaseTool` instances the model can call.
+- **Wrap the model call** — intercept `wrap_model_call` / `awrap_model_call` to modify the request or response (inject a system-prompt section, rewrite messages, add caching headers, etc.).
+
+| Layer | Tools added | Model-call effect |
+|---|---|---|
+| `TodoListMiddleware` | `write_todos` | None |
+| `SkillsMiddleware` | Loaded skill tools | Injects skill catalog into system prompt |
+| `FilesystemMiddleware` | `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute` | None |
+| `SubAgentMiddleware` | `task` | None |
+| `SummarizationMiddleware` | None | Compacts conversation when token threshold exceeded |
+| `PatchToolCallsMiddleware` | None | Normalizes tool-call formatting |
+| `AnthropicPromptCachingMiddleware` | None | Adds Anthropic cache headers |
+| `MemoryMiddleware` | None | Injects AGENTS.md content into system prompt |
+| `HumanInTheLoopMiddleware` | None | Gates specified tool calls for approval |
+
+### Subagent middleware stack
+
+Every declarative `SubAgent` receives its own copy of the base layers before any subagent-specific middleware:
+
+```python
+subagent_middleware = [
+    TodoListMiddleware(),
+    FilesystemMiddleware(backend=backend),
+    create_summarization_middleware(subagent_model, backend),
+    PatchToolCallsMiddleware(),
+    # SkillsMiddleware appended when subagent declares skills
+    # subagent-specific user middleware appended here
+    AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+]
+```
+
+A `general-purpose` subagent with this stack is always added unless the caller provides one by that name.
+
+### Base system prompt
+
+`create_deep_agent()` ships a `BASE_AGENT_PROMPT` that instructs the model to be concise, avoid preamble, read before acting, verify its work, and emit progress updates on long tasks. A caller-supplied `system_prompt` is prepended to (not replacing) this base.
+
+### Zero-configuration usage
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Research LangGraph and write a summary"}]
+})
+```
+
+Out of the box the agent can manage a todo list, read and write files, run shell commands (if the backend implements sandboxing), delegate subtasks to a general-purpose subagent, summarize its own context when conversations grow long, and cache prompts for Anthropic models.
+
+### Extending without replacing
+
+User-supplied middleware slots in at position 8 — after `PatchToolCallsMiddleware`, before `AnthropicPromptCachingMiddleware` — leaving the default stack intact:
+
+```python
+from langchain.chat_models import init_chat_model
+
+agent = create_deep_agent(
+    model=init_chat_model("openai:gpt-4o"),
+    tools=[my_custom_tool],
+    system_prompt="You are a research assistant.",
+    middleware=[my_custom_middleware],
+)
+```
+
+MCP tools are supported via `langchain-mcp-adapters` and passed through `tools=`.
 
 ## Involved Entities
 
-| Entity | Role In This Concept |
-| --- | --- |
-| [Agent Customization Surface](../syntheses/agent-customization-surface.md) | How tools, prompts, skills, memory, subagents, and backends compose |
-| [Graph Factory](../entities/graph-factory.md) | `create_deep_agent` and the default SDK graph assembly |
-| [Evals System](../entities/evals-system.md) | Behavioral eval framework, category taxonomy, and radar reporting |
-| [SDK to CLI Composition](../syntheses/sdk-to-cli-composition.md) | How the CLI extends and configures the base SDK graph |
-| [Architecture Overview](../summaries/architecture-overview.md) | High-level orientation to the monorepo, package boundaries, and execution model |
-| [Codebase Map](../summaries/codebase-map.md) | Maps `libs/`, `partners/`, and `examples/` to the corresponding wiki pages |
+- [`create_deep_agent()`](../entities/graph-factory.md) — the factory that assembles the full stack
+- [`TodoListMiddleware`](../entities/graph-factory.md) — planning layer (`write_todos`)
+- [`FilesystemMiddleware`](../syntheses/agent-customization-surface.md) — file and shell tools
+- [`SubAgentMiddleware`](../syntheses/agent-customization-surface.md) — `task` tool and subagent dispatch
+- [`SummarizationMiddleware`](./context-management-and-summarization.md) — context management layer
+- [`PatchToolCallsMiddleware`](../entities/graph-factory.md) — tool-call normalization
+- [`AnthropicPromptCachingMiddleware`](../entities/graph-factory.md) — prompt caching
+- [`MemoryMiddleware`](../syntheses/agent-customization-surface.md) — AGENTS.md injection
+- [`HumanInTheLoopMiddleware`](./human-in-the-loop-approval.md) — approval gating
 
 ## Source Evidence
 
-| File | Why It Matters |
-| --- | --- |
-| `libs/deepagents/deepagents/graph.py` | Main `create_deep_agent` assembly logic and default base prompt |
-| `libs/deepagents/deepagents/__init__.py` | Public SDK export surface |
-| `libs/deepagents/deepagents/backends/protocol.py` | Backend and execution protocol definitions plus result types |
-| `libs/deepagents/deepagents/backends/filesystem.py` | Concrete filesystem backend with optional virtual path mode |
-| `libs/deepagents/deepagents/middleware/subagents.py` | Core subagent specs, tool description, and middleware integration |
-| `libs/deepagents/deepagents/middleware/async_subagents.py` | Remote/background subagent handling |
+**Default stack assembly** — `libs/deepagents/deepagents/graph.py`, lines 292–322. The `deepagent_middleware` list is built in that block with the ordering documented above.
+
+**Subagent stack** — same file, lines 261–271. Mirrors the main agent's base layers, then appends subagent-specific middleware.
+
+**README tagline** — `README.md`, lines 3 and 24:
+
+> "The batteries-included agent harness."
+> "An opinionated, ready-to-run agent out of the box. Instead of wiring up prompts, tools, and context management yourself, you get a working agent immediately and customize what you need."
+
+**Public API surface** — `libs/deepagents/deepagents/__init__.py`: only `create_deep_agent` and the subagent types are exported, confirming the factory is the primary entry point.
+
+**Middleware insertion comment** — `graph.py`, lines 314–317:
+
+```python
+if middleware:
+    deepagent_middleware.extend(middleware)
+# Caching + memory after all other middleware so memory updates don't
+# invalidate the Anthropic prompt cache prefix.
+```
 
 ## See Also
 
+- [Context Management and Summarization](./context-management-and-summarization.md)
+- [Human-in-the-Loop Approval](./human-in-the-loop-approval.md)
 - [Agent Customization Surface](../syntheses/agent-customization-surface.md)
-- [Graph Factory](../entities/graph-factory.md)
-- [Evals System](../entities/evals-system.md)
 - [SDK to CLI Composition](../syntheses/sdk-to-cli-composition.md)
 - [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
