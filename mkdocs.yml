@@ -1,6 +1,7 @@
 site_name: Knowledge Base
 site_description: Structured architecture wikis for multiple codebases
-site_url: ""
+site_url: "https://weiqiangyu0528.github.io/LLM_Knowledge_Base/"
+repo_url: "https://github.com/WeiqiangYu0528/LLM_Knowledge_Base"
 
 theme:
   name: material
