@@ -2,60 +2,146 @@
 
 ## Overview
 
-The evals system is a behavioral test harness for Deep Agents. Instead of focusing only on unit-level correctness, it runs agents end to end against real models and scores both correctness and trajectory quality.
-
-The eval harness is architecture pressure, not just reporting; it captures what behaviors the default graph is expected to retain over time.
-
-In practice, this page should be read as a boundary explanation, not just a file list. Evals System owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [Graph Factory](graph-factory.md), [Example Agents](example-agents.md), [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+The evals system (`libs/evals/`) is a behavioral end-to-end test harness for the Deep Agents SDK. Rather than mocking the model or graph, each eval runs a real agent against a real LLM and asserts on the resulting trajectory — tool calls made, files mutated, and final text produced. Results are logged to LangSmith under the `deepagents-evals` test suite, which powers cross-model comparisons and regression tracking. The package also integrates with [Harbor](https://harborframes.com/) as a runner for the Terminal Bench 2.0 benchmark, exposing deepagents as a `DeepAgentsWrapper` that Harbor can evaluate in Docker, Daytona, Modal, or Runloop sandboxes.
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/evals/README.md` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `libs/evals/deepagents_evals/radar.py`, `libs/evals/deepagents_evals/categories.json`, `libs/evals/tests/evals/` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Eval philosophy, test categories, and benchmark coverage; Radar chart generation and category labels; Single source of truth for category names and display labels; End-to-end eval definitions and fixtures |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | state changes and runtime handoffs described in the cited files |
+```python
+class TrajectoryScorer:
+    """Fluent builder for trajectory assertions."""
+    def expect(self, agent_steps: int | None = None,
+               tool_call_requests: int | None = None) -> TrajectoryScorer:
+        """Soft efficiency checks — logged but never fail the test."""
+
+    def success(self, *assertions: SuccessAssertion) -> TrajectoryScorer:
+        """Hard correctness checks — any failure hard-fails the test."""
+
+class AgentTrajectory:
+    """Captured run: messages, tool calls, final text, timing, file state."""
+
+# Built-in success assertions
+final_text_contains(substring: str, *, case_insensitive: bool = False) -> SuccessAssertion
+file_equals(path: str, expected: str) -> SuccessAssertion
+llm_judge(*criteria: str) -> SuccessAssertion   # openevals-backed semantic grading
+
+def run_agent(
+    agent: CompiledStateGraph,
+    *,
+    model: BaseChatModel,
+    query: str,
+    scorer: TrajectoryScorer,
+) -> AgentTrajectory: ...
+```
+
+**Eval categories** (defined in `deepagents_evals/categories.json`):
+| Category | Description |
+|----------|-------------|
+| `file_operations` | Read, write, edit, ls, parallel ops, pagination |
+| `retrieval` | Grep, glob, deep-nesting search, multi-file parallel reads, FRAMES benchmark |
+| `tool_use` | Tool selection, multi-step chaining, Nexus, BFCL v3 |
+| `memory` | AGENTS.md recall, preference persistence, MemoryAgentBench (ICLR 2026) |
+| `conversation` | Followup question relevance, tau2-bench airline domain |
+| `summarization` | Summarization middleware triggers, filesystem offload, `/compact` tool |
+| `unit_test` | HITL interrupts, subagent delegation, system-prompt adherence, skill loading |
+
+**Total: 85 evals across 7 categories.**
 
 ## Architecture
 
-Evals System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/evals/README.md`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+**Two-tier assertion model**: Every eval uses a `TrajectoryScorer` with two tiers. `.success()` assertions are correctness checks that hard-fail the pytest test if they do not pass (e.g. `final_text_contains`, `file_equals`, `llm_judge`). `.expect()` assertions are efficiency targets — expected step count, expected tool call count — that are always logged to LangSmith but never fail the test. This separation lets the suite track efficiency regressions without blocking CI on soft metrics.
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+```python
+@pytest.mark.langsmith
+def test_example(model: BaseChatModel) -> None:
+    agent = create_deep_agent(model=model)
+    run_agent(
+        agent,
+        model=model,
+        query="What is 2 + 2?",
+        scorer=(
+            TrajectoryScorer()
+            .expect(agent_steps=1)
+            .success(final_text_contains("4"))
+        ),
+    )
+```
 
-For implementers, the important question is not only what Evals System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+**LLM-as-judge**: When substring matching is insufficient, `llm_judge(*criteria)` wraps [openevals](https://github.com/langchain-ai/openevals) to grade the agent's final answer against free-text human-readable criteria. The judge model runs separately from the agent under test.
 
-## Runtime Behavior
+**pytest infrastructure**: `conftest.py` provides a `--model` CLI flag and `model`/`model_name` fixtures. It aborts the entire suite if `LANGSMITH_TRACING=true` without a `LANGSMITH_API_KEY`. A custom `pytest_reporter.py` plugin collects efficiency data and prints a summary after each run:
 
-1. `evals/README.md` becomes relevant when eval philosophy, test categories, and benchmark coverage.
-2. `deepagents_evals/radar.py` becomes relevant when radar chart generation and category labels.
-3. `deepagents_evals/categories.json` becomes relevant when single source of truth for category names and display labels.
-4. `evals/` becomes relevant when end-to-end eval definitions and fixtures.
+```
+correctness: 0.85       # fraction of tests passing all success assertions
+step_ratio: 1.10        # actual steps / expected steps (micro-averaged)
+tool_call_ratio: 1.05   # actual tool calls / expected
+solve_rate: 0.0342      # mean of expected_steps / duration_s for passing tests
+median_duration_s: 3.12
+```
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+**Running evals**:
+```bash
+cd libs/evals
+export ANTHROPIC_API_KEY="sk-ant-..."
+export LANGSMITH_API_KEY="lsv2_..."
+export LANGSMITH_TRACING=true
 
-## Variants, Boundaries, and Failure Modes
+make evals                                      # all evals, default model
+pytest tests/evals --model claude-sonnet-4-6-20250514  # specific model
+pytest tests/evals --eval-category memory       # single category
+pytest tests/evals/test_file_operations.py      # single file
+```
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+**External benchmarks**: `test_external_benchmarks.py` runs three curated benchmarks against real data:
+- **FRAMES** — multi-hop retrieval over Wikipedia-style documents
+- **Nexus** — nested function composition
+- **BFCL v3** — multi-turn stateful tool calling with Python API implementations in `tests/evals/data/bfcl_apis/`
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+**Harbor / Terminal Bench 2.0**: The `deepagents_harbor` package exposes `DeepAgentsWrapper`, a Harbor-compatible agent class that runs deepagents inside any Harbor-supported environment. Terminal Bench 2.0 has 90+ tasks spanning software engineering, biology, security, and gaming. Harbor rewards score 0.0–1.0 based on test pass rate and can be pushed to LangSmith as `harbor_reward` feedback.
+
+```bash
+# Run via Docker (sequential)
+uv run harbor run --agent-import-path deepagents_harbor:DeepAgentsWrapper \
+  --dataset terminal-bench@2.0 -n 1 --env docker
+
+# Run via Daytona (40 concurrent)
+make run-terminal-bench-daytona
+```
+
+**Radar charts**: Full runs (3+ categories) generate a per-category radar chart uploaded as the `radar-chart` CI artifact:
+```bash
+python scripts/generate_radar.py --summary evals_summary.json -o charts/radar.png
+```
+
+**Catalog drift check**: `EVAL_CATALOG.md` is auto-generated by `scripts/generate_eval_catalog.py`. A unit test (`tests/unit_tests/test_eval_catalog.py`) fails CI if the file is stale after adding or removing evals.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `libs/evals/README.md` | Eval philosophy, test categories, and benchmark coverage |
-| `libs/evals/deepagents_evals/radar.py` | Radar chart generation and category labels |
-| `libs/evals/deepagents_evals/categories.json` | Single source of truth for category names and display labels |
-| `libs/evals/tests/evals/` | End-to-end eval definitions and fixtures |
+|------|---------|
+| `libs/evals/tests/evals/utils.py` | Core framework: `AgentTrajectory`, assertion classes, `TrajectoryScorer`, `run_agent` |
+| `libs/evals/tests/evals/llm_judge.py` | `llm_judge` success assertion backed by openevals |
+| `libs/evals/tests/evals/conftest.py` | pytest fixtures: `--model` flag, `model`/`model_name`, LangSmith metadata |
+| `libs/evals/tests/evals/pytest_reporter.py` | Custom pytest plugin: efficiency data collection and summary report |
+| `libs/evals/tests/evals/test_file_operations.py` | 13 file-ops evals: read/write/edit/ls, parallel, grep, glob, pagination |
+| `libs/evals/tests/evals/test_tool_selection.py` | Tool selection from intent: direct, indirect, multi-step |
+| `libs/evals/tests/evals/test_tool_usage_relational.py` | Multi-step chaining with dependent lookups (1–5 tool chain depth) |
+| `libs/evals/tests/evals/test_memory.py` | Memory recall from AGENTS.md, preference persistence, composite backends |
+| `libs/evals/tests/evals/test_memory_multiturn.py` | Multi-turn implicit/explicit preference extraction |
+| `libs/evals/tests/evals/test_external_benchmarks.py` | FRAMES, Nexus, BFCL v3 runners |
+| `libs/evals/tests/evals/memory_agent_bench/` | MemoryAgentBench (ICLR 2026) runner |
+| `libs/evals/tests/evals/tau2_airline/` | tau2-bench airline domain: multi-turn conversation scoring |
+| `libs/evals/tests/evals/test_summarization.py` | Summarization middleware and filesystem offload |
+| `libs/evals/tests/evals/test_hitl.py` | Human-in-the-loop via `interrupt_on` configs |
+| `libs/evals/tests/evals/test_subagents.py` | Subagent delegation behavior |
+| `libs/evals/tests/evals/test_skills.py` | Skill discovery, reading, and application |
+| `libs/evals/deepagents_evals/categories.json` | Category registry: names, labels, radar inclusion flags |
+| `libs/evals/deepagents_harbor/` | Harbor `DeepAgentsWrapper` for Terminal Bench 2.0 |
+| `libs/evals/scripts/generate_radar.py` | Radar chart generator from eval summary JSON |
+| `libs/evals/EVAL_CATALOG.md` | Auto-generated catalog: all 85 evals grouped by category with source links |
 
 ## See Also
 
-- [Graph Factory](graph-factory.md)
-- [Example Agents](example-agents.md)
-- [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md)
-- [Evaluation Feedback Loop](../syntheses/evaluation-feedback-loop.md)
-- [Sdk To Cli Composition](../syntheses/sdk-to-cli-composition.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Subagent System](./subagent-system.md)
+- [Memory System](./memory-system.md)
+- [Skills System](./skills-system.md)
+- [Sandbox Partners](./sandbox-partners.md)

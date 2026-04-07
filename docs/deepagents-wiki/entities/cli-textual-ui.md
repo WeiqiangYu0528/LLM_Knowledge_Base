@@ -2,63 +2,102 @@
 
 ## Overview
 
-The Textual UI is the primary interactive presentation layer for `deepagents-cli`. It handles chat rendering, tool-call visualization, model/theme selectors, input widgets, notifications, and several workflow-specific screens.
-
-The Textual app is a separate UI layer, not the runtime itself, so it must translate agent state into terminal widgets without owning the agent graph.
-
-In practice, this page should be read as a boundary explanation, not just a file list. CLI Textual UI owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [CLI Runtime](cli-runtime.md), [Session Persistence](session-persistence.md), [Interactive Session Lifecycle](../syntheses/interactive-session-lifecycle.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+The CLI Textual UI is the interactive terminal interface for deepagents-cli, built on the [Textual](https://github.com/Textualize/textual) framework. The `DeepAgentsApp` class is the root application that composes the full screen layout: a scrollable chat area containing a `WelcomeBanner`, a stream-layout message list, and a bottom `ChatInput` with autocomplete — all framed by a docked `StatusBar`. It renders streaming LLM tokens, tool call results, inline approval menus, and user messages in a single-process async event loop. Focus management, key bindings, and mode switching (normal / shell / command) are handled at the application level, while individual widgets carry their own embedded Textual CSS rules. The app bridges LangGraph's streaming output to Textual's message bus via `TextualUIAdapter`, enabling token-by-token display without blocking the UI.
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/cli/deepagents_cli/app.py` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `libs/cli/deepagents_cli/widgets/messages.py`, `libs/cli/deepagents_cli/widgets/message_store.py`, `libs/cli/deepagents_cli/theme.py` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Main Textual application; Chat message rendering widgets; In-memory message state for rendering; Theme definitions and registry |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | In-memory message state for rendering |
+```python
+class DeepAgentsApp(App):
+    """Root Textual application."""
+    CSS_PATH = "app.tcss"
+    ENABLE_COMMAND_PALETTE = False   # Custom slash-command system used instead
+    BINDINGS: ClassVar[list[BindingType]]  # escape, ctrl+c/d/t/o/x, approval keys
+
+class StatusBar(Horizontal):
+    """Bottom-docked bar: mode badge, auto-approve pill, cwd, git branch, tokens, model."""
+    mode: reactive[str]            # "normal" | "shell" | "command"
+    auto_approve: reactive[bool]
+    cwd: reactive[str]
+    branch: reactive[str]
+    tokens: reactive[int]
+
+class ModelLabel(Widget):
+    """Right-aligned model name with smart truncation (drops provider prefix when narrow)."""
+    provider: reactive[str]
+    model: reactive[str]
+
+class WelcomeBanner(Static):
+    """Startup banner: ASCII art, version, thread ID, LangSmith link, MCP count, tip."""
+
+class ChatInput(Vertical):
+    """Multi-line TextArea with slash-command autocomplete and JSONL history."""
+
+InputMode = Literal["normal", "shell", "command"]
+
+@dataclass(frozen=True, slots=True)
+class QueuedMessage:
+    text: str
+    mode: InputMode
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeferredAction:
+    kind: DeferredActionKind   # "model_switch" | "thread_switch" | "chat_output"
+    execute: Callable[[], Awaitable[None]]
+```
+
+Message widget types (from `widgets/messages.py`):
+- `UserMessage` / `QueuedUserMessage` — outgoing user turns
+- `AssistantMessage` — streaming assistant reply via Textual's `MarkdownStream`
+- `ToolCallMessage` — tool invocation with collapsible diff/output
+- `AppMessage` — system-level notices (model switch, thread reset)
+- `SkillMessage` — skill invocation notice
+- `ErrorMessage` — error display with styled text
 
 ## Architecture
 
-CLI Textual UI is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/cli/deepagents_cli/app.py`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+**Screen layout** (`app.tcss`): The `Screen` uses `layout: vertical` with two CSS layers (`base` and `autocomplete` for z-ordering). The main scrollable area (`#chat`, `height: 1fr`) holds `#welcome-banner` followed by `#messages`, which uses `layout: stream` — Textual's O(1) incremental-placement layout — to avoid full reflow as the conversation grows. Below the scroll sits `#bottom-app-container` housing `ChatInput` (`min-height: 3`, `max-height: 25`). The `StatusBar` is `dock: bottom` and always 1 terminal row tall.
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+**Startup sequence**: `DeepAgentsApp.on_mount` fires a background Textual worker that starts the LangGraph server process and MCP connections; on success it posts a `ServerReady` message containing the compiled agent graph. While connecting, `WelcomeBanner` shows a "Connecting to local server..." footer. `set_connected(mcp_tool_count)` transitions it to the ready state with a rotating tip.
 
-For implementers, the important question is not only what CLI Textual UI does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+**Key bindings**:
+| Key | Action |
+|-----|--------|
+| `Escape` | Interrupt current agent run |
+| `Ctrl+C` | Quit or interrupt (context-sensitive) |
+| `Ctrl+D` | Quit |
+| `Shift+Tab` / `Ctrl+T` | Toggle auto-approve mode |
+| `Ctrl+O` | Toggle tool output visibility |
+| `Ctrl+X` | Open `$EDITOR` for multi-line prompt composition |
+| `y/1`, `a/2`, `n/3`, arrow/`j`/`k` | Approval menu navigation |
 
-## Runtime Behavior
+**Streaming tokens**: `TextualUIAdapter` bridges LangGraph's async streaming loop to Textual's message bus. Each token chunk posts a Textual message that `AssistantMessage` uses to update a `MarkdownStream` widget progressively. The `StatusBar` hides the token counter during streaming (`hide_tokens()`) and restores it via `set_tokens(count, approximate=...)` when the final usage arrives. When generation is interrupted before the model reports usage, the count is shown with a `+` suffix to flag it as approximate.
 
-1. `deepagents_cli/app.py` becomes relevant when main Textual application.
-2. `widgets/messages.py` becomes relevant when chat message rendering widgets.
-3. `widgets/message_store.py` becomes relevant when in-memory message state for rendering.
-4. `deepagents_cli/theme.py` becomes relevant when theme definitions and registry.
-5. `deepagents_cli/app.tcss` becomes relevant when textual stylesheet.
+**Approval flow**: When a tool call requires user approval, an `ApprovalMenu` is inserted inline into the message list. A deferred-approval worker waits up to `_TYPING_IDLE_THRESHOLD_SECONDS` (2 s) of keyboard idle time — or `_DEFERRED_APPROVAL_TIMEOUT_SECONDS` (30 s) absolute — before showing the menu, so mid-sentence keystrokes do not accidentally dismiss it. A placeholder widget is shown while waiting.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+**`ChatInput` internals**: Built on Textual's `TextArea`, it uses a `MultiCompletionManager` backed by two controllers: `SlashCommandController` for `/` slash commands and `FuzzyFileController` for `@`-prefixed file references. History persists to `~/.deepagents/history.jsonl`. Paste-burst detection uses inter-keystroke timing (`_PASTE_BURST_CHAR_GAP_SECONDS = 0.03 s`) to distinguish terminal paste events from normal typing. Some terminals send `\` + `Enter` for Shift+Enter; the code detects this within a `_BACKSLASH_ENTER_GAP_SECONDS` (0.15 s) window and converts it to a newline insertion.
 
-## Variants, Boundaries, and Failure Modes
+**Theme system**: `theme.py` maintains a `ThemeEntry.REGISTRY` of named themes (e.g. `langchain`, `langchain-light`, `textual-ansi`). The active palette is exposed via `get_theme_colors(widget_or_app)` and used by widgets to build Textual `Style` objects with hex color values. The selected theme is persisted to `~/.deepagents/config.toml` via atomic temp-file replacement.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
-
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+**iTerm2 workaround**: The module disables iTerm2's cursor-guide highlight at import time via OSC 1337 escape sequences written to stderr, and restores it via `atexit`. This prevents a visual artifact where the cursor-line highlight flickers when Textual takes over the alternate screen buffer.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `libs/cli/deepagents_cli/app.py` | Main Textual application |
-| `libs/cli/deepagents_cli/widgets/messages.py` | Chat message rendering widgets |
-| `libs/cli/deepagents_cli/widgets/message_store.py` | In-memory message state for rendering |
-| `libs/cli/deepagents_cli/theme.py` | Theme definitions and registry |
-| `libs/cli/deepagents_cli/app.tcss` | Textual stylesheet |
+|------|---------|
+| `libs/cli/deepagents_cli/app.py` | `DeepAgentsApp` root class, key bindings, startup sequence, streaming integration, deferred actions |
+| `libs/cli/deepagents_cli/app.tcss` | Textual CSS: screen layers, chat/message/input areas, approval menus, scrollbar sizing |
+| `libs/cli/deepagents_cli/widgets/chat_input.py` | `ChatInput`: multi-line TextArea, autocomplete, JSONL history, paste-burst and Shift+Enter detection |
+| `libs/cli/deepagents_cli/widgets/status.py` | `StatusBar` and `ModelLabel`: mode badges, auto-approve pill, cwd, branch, token count |
+| `libs/cli/deepagents_cli/widgets/welcome.py` | `WelcomeBanner`: ASCII art, version, thread ID, LangSmith link, tip rotation, connect/fail states |
+| `libs/cli/deepagents_cli/widgets/messages.py` | All message widget types: user, assistant (`MarkdownStream`), tool call, error, app notices |
+| `libs/cli/deepagents_cli/widgets/approval.py` | Inline tool-approval menu widget and deferred-approval placeholder |
+| `libs/cli/deepagents_cli/widgets/autocomplete.py` | `SlashCommandController`, `FuzzyFileController`, `MultiCompletionManager` |
+| `libs/cli/deepagents_cli/widgets/history.py` | JSONL-backed prompt history manager |
+| `libs/cli/deepagents_cli/textual_adapter.py` | Bridge between LangGraph streaming events and Textual's message bus |
+| `libs/cli/deepagents_cli/theme.py` | Theme registry, `ThemeEntry.REGISTRY`, `get_theme_colors()` |
 
 ## See Also
 
-- [CLI Runtime](cli-runtime.md)
-- [Session Persistence](session-persistence.md)
-- [Interactive Session Lifecycle](../syntheses/interactive-session-lifecycle.md)
-- [Human in the Loop Approval](../concepts/human-in-the-loop-approval.md)
-- [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md)
-- [Sdk To Cli Composition](../syntheses/sdk-to-cli-composition.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [CLI Runtime](./cli-runtime.md)
+- [MCP System](./mcp-system.md)
+- [Session Persistence](./session-persistence.md)

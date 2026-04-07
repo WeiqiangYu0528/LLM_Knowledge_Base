@@ -47,6 +47,7 @@ nav:
   - Home:
       - Index: index.md
       - Claude Code Depth Standard: depth-standard.md
+      - Publishing Workflow: publishing-workflow.md
   - Claude Code:
       - Index: claude-code/index.md
       - Summaries:

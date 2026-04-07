@@ -2,63 +2,146 @@
 
 ## Overview
 
-The partner packages extend Deep Agents into additional execution environments. Most of them expose sandbox backends for running code remotely; one, QuickJS, adds a lightweight computation middleware rather than a full remote sandbox.
-
-Partner packages matter because remote execution is a product surface, not merely a transport detail.
-
-In practice, this page should be read as a boundary explanation, not just a file list. Sandbox Partners owns a specific slice of the Deep Agents runtime, but it only makes sense in relation to neighboring systems such as [Backend System](backend-system.md), [CLI Runtime](cli-runtime.md), [Local vs Remote Execution](../concepts/local-vs-remote-execution.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+The partner packages under `libs/partners/` extend Deep Agents with remote sandbox execution environments and one lightweight computation middleware. Three packages — `langchain-daytona`, `langchain-modal`, and `langchain-runloop` — each provide a concrete `BaseSandbox` subclass that implements the `SandboxBackendProtocol` by wrapping a cloud-hosted container or devbox. A fourth package, `langchain-quickjs`, is not a remote sandbox but adds a stateless in-process JavaScript REPL tool via QuickJS middleware. All three sandbox packages share the same file-operation logic (read, write, edit, ls, grep, glob) inherited from `BaseSandbox` in the core `deepagents` library, and only need to implement `execute()` and `upload_files()` themselves.
 
 ## Key Types / Key Concepts
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `libs/partners/daytona/README.md` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `libs/partners/modal/README.md`, `libs/partners/runloop/README.md`, `libs/partners/quickjs/README.md` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Daytona sandbox package; Modal sandbox package; Runloop sandbox package; QuickJS REPL middleware package |
-| Extension or policy points | The main extension or gating surfaces live around `libs/partners/daytona/README.md`, `libs/partners/modal/README.md`, `libs/partners/runloop/README.md`. |
-| Persistent effects | Daytona sandbox package; Modal sandbox package; Runloop sandbox package |
+```python
+# Core protocol (libs/deepagents/deepagents/backends/protocol.py)
+class SandboxBackendProtocol(Protocol):
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse: ...
+    def upload_files(self, files: list[FileData]) -> FileUploadResponse: ...
+
+# Base class (libs/deepagents/deepagents/backends/sandbox.py)
+class BaseSandbox(ABC):
+    """Implements ls, read, write, edit, grep, glob via execute() + upload_files().
+    File ops use base64-encoded Python3 one-liners run inside the sandbox shell."""
+
+# Partner implementations
+class DaytonaSandbox(BaseSandbox):   # langchain-daytona
+    def __init__(self, *, sandbox: daytona.Sandbox,
+                 timeout: int = 1800,
+                 sync_polling_interval: float | Callable = 0.1) -> None: ...
+
+class ModalSandbox(BaseSandbox):     # langchain-modal
+    def __init__(self, *, sandbox: modal.Sandbox) -> None: ...
+
+class RunloopSandbox(BaseSandbox):   # langchain-runloop
+    def __init__(self, *, devbox: Devbox) -> None: ...
+
+# QuickJS middleware (langchain-quickjs)
+class QuickJSMiddleware:
+    def __init__(self, ptc: list[Callable] = [],
+                 add_ptc_docs: bool = False) -> None: ...
+```
+
+**`ExecuteResponse`**: contains `output: str`, `exit_code: int`, `truncated: bool`.
 
 ## Architecture
 
-Sandbox Partners is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `libs/partners/daytona/README.md`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### `BaseSandbox` — shared file-operation layer
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+All file operations in `BaseSandbox` are implemented by sending base64-encoded Python3 one-liners through `execute()`. This design means the partner packages have zero dependency on remote filesystem APIs and work identically regardless of the sandbox provider. For example, glob runs a `python3 -c "import glob, json, base64 ..."` snippet; edit transfers the old/new strings as base64-encoded heredoc input for payloads under `_EDIT_INLINE_MAX_BYTES` (50,000 bytes), and falls back to `upload_files` + a server-side replace script for larger payloads.
 
-For implementers, the important question is not only what Sandbox Partners does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+### Daytona (`langchain-daytona`)
 
-## Runtime Behavior
+Wraps an existing `daytona.Sandbox` instance. Execute uses Daytona's `SessionExecuteRequest` API. Because Daytona's native execution is asynchronous, `DaytonaSandbox` implements a configurable sync polling loop: `sync_polling_interval` can be a fixed float (seconds between polls, default 0.1 s) or a callable that receives elapsed time and returns the next delay, enabling adaptive backoff.
 
-1. `daytona/README.md` becomes relevant when daytona sandbox package.
-2. `modal/README.md` becomes relevant when modal sandbox package.
-3. `runloop/README.md` becomes relevant when runloop sandbox package.
-4. `quickjs/README.md` becomes relevant when quickJS REPL middleware package.
-5. `libs/README.md` becomes relevant when monorepo inventory that positions `partners/` as integration packages.
+```python
+from daytona import Daytona
+from langchain_daytona import DaytonaSandbox
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox, timeout=300, sync_polling_interval=0.25)
+result = backend.execute("echo hello")
+```
 
-## Variants, Boundaries, and Failure Modes
+**Required env var:** `DAYTONA_API_KEY`
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+**Trade-offs:** Cloud-hosted; requires Daytona account. Good for Harbor's high-concurrency Terminal Bench runs (the evals Makefile uses `--jobs daytona` for 40 concurrent trials). The polling interval is the main latency tuning knob.
 
-The main extension and failure surfaces are concentrated around `libs/partners/daytona/README.md`, `libs/partners/modal/README.md`, `libs/partners/runloop/README.md`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Modal (`langchain-modal`)
+
+Wraps a `modal.Sandbox` instance. Unlike Daytona, Modal exposes a native filesystem API (`sandbox.open(path, mode)`), so `ModalSandbox` overrides `_read_file` and `_write_file` with direct Modal calls rather than going through `execute()`. For everything else (ls, grep, glob, edit) it falls back to the `BaseSandbox` shell-script approach. File-not-found conditions are detected by catching `modal.exception.FilesystemExecutionError`.
+
+```python
+import modal
+from langchain_modal import ModalSandbox
+
+sandbox = ModalSandbox(sandbox=modal.Sandbox.create(app=modal.App.lookup("your-app")))
+result = sandbox.execute("python3 script.py")
+```
+
+**Required:** Modal account and `modal setup` authentication. The `nvidia_deep_agent` example uses Modal for GPU execution (A10G by default, configurable to A100/T4/H100).
+
+**Trade-offs:** Supports GPU hardware (the only partner that does). Native filesystem API makes read/write faster than shell-script round-trips. CPU mode uses a lightweight image; GPU mode uses the NVIDIA RAPIDS Docker image.
+
+### Runloop (`langchain-runloop`)
+
+Wraps a Runloop `Devbox`. Execute delegates to `devbox.cmd.exec(command, timeout=...)`, combining stdout and stderr into a single output string. File operations use `BaseSandbox`'s shell-script approach (no native filesystem API).
+
+```python
+from runloop_api_client import RunloopSDK
+from langchain_runloop import RunloopSandbox
+
+client = RunloopSDK(bearer_token=os.environ["RUNLOOP_API_KEY"])
+devbox = client.devbox.create()
+sandbox = RunloopSandbox(devbox=devbox)
+try:
+    result = sandbox.execute("echo hello")
+finally:
+    devbox.shutdown()
+```
+
+**Required env var:** `RUNLOOP_API_KEY`
+
+**Trade-offs:** Devboxes must be explicitly shut down. The `id` property exposes the devbox ID for reuse across sessions (e.g. Ralph mode's `--sandbox-id` flag).
+
+### QuickJS (`langchain-quickjs`)
+
+Not a remote sandbox. Adds a stateless `repl` tool to any Deep Agent that evaluates JavaScript snippets using the embedded [QuickJS](https://bellard.org/quickjs/) engine. Each call starts from a fresh context (no state carries between calls). Python callables exposed via `ptc` (Python-to-callable) are bridged as foreign functions inside the REPL, with primitive type passing (`int`, `float`, `bool`, `str`, `None`, lists, dicts). Async Python functions are supported via a dedicated daemon-thread event loop.
+
+```python
+from langchain_quickjs import QuickJSMiddleware
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:gpt-4.1",
+    middleware=[QuickJSMiddleware(ptc=[normalize_name], add_ptc_docs=True)],
+)
+```
+
+**Use cases:** Small computations, JSON manipulation, control flow, calling Python helpers without spawning a sandbox. Not suitable for Node.js or browser APIs, does not support HIL in the REPL, and does not yet support `ToolRuntime`.
+
+### Comparison
+
+| Provider | Remote | GPU | Native FS API | Polling required | Key env var |
+|----------|--------|-----|---------------|-----------------|-------------|
+| Daytona | Yes | No | No (shell) | Yes (configurable) | `DAYTONA_API_KEY` |
+| Modal | Yes | Yes | Yes (partial) | No | `modal setup` / token |
+| Runloop | Yes | No | No (shell) | No | `RUNLOOP_API_KEY` |
+| QuickJS | No | No | N/A | N/A | None |
+
+All remote sandbox backends share the same `BaseSandbox` file-op layer and are drop-in replacements for each other when passed as the `backend` argument to `create_deep_agent`.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `libs/partners/daytona/README.md` | Daytona sandbox package |
-| `libs/partners/modal/README.md` | Modal sandbox package |
-| `libs/partners/runloop/README.md` | Runloop sandbox package |
-| `libs/partners/quickjs/README.md` | QuickJS REPL middleware package |
-| `libs/README.md` | Monorepo inventory that positions `partners/` as integration packages |
+|------|---------|
+| `libs/deepagents/deepagents/backends/sandbox.py` | `BaseSandbox` ABC: shared file-op shell-script templates, `_EDIT_INLINE_MAX_BYTES`, `_edit_via_upload` |
+| `libs/deepagents/deepagents/backends/protocol.py` | `SandboxBackendProtocol`, `ExecuteResponse`, `FileData`, and all result types |
+| `libs/partners/daytona/langchain_daytona/sandbox.py` | `DaytonaSandbox`: polling execute, configurable `sync_polling_interval` |
+| `libs/partners/daytona/README.md` | Daytona installation and quick-start |
+| `libs/partners/modal/langchain_modal/sandbox.py` | `ModalSandbox`: native file API for read/write, shell-script for everything else |
+| `libs/partners/modal/README.md` | Modal installation and quick-start |
+| `libs/partners/runloop/langchain_runloop/sandbox.py` | `RunloopSandbox`: `devbox.cmd.exec` execute, `id` property |
+| `libs/partners/runloop/README.md` | Runloop installation and quick-start |
+| `libs/partners/quickjs/langchain_quickjs/__init__.py` | `QuickJSMiddleware`: stateless JS REPL, ptc bridging, async foreign function support |
+| `libs/partners/quickjs/README.md` | QuickJS usage, REPL behavior, current limitations |
 
 ## See Also
 
-- [Backend System](backend-system.md)
-- [CLI Runtime](cli-runtime.md)
-- [Local vs Remote Execution](../concepts/local-vs-remote-execution.md)
-- [Remote Subagent and Sandbox Flow](../syntheses/remote-subagent-and-sandbox-flow.md)
-- [Batteries Included Agent Architecture](../concepts/batteries-included-agent-architecture.md)
-- [Sdk To Cli Composition](../syntheses/sdk-to-cli-composition.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Backend System](./backend-system.md)
+- [Evals System](./evals-system.md)
+- [Example Agents](./example-agents.md)
+- [Subagent System](./subagent-system.md)

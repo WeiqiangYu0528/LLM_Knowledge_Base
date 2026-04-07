@@ -28,6 +28,7 @@ That keeps separate codebases documented independently while still sharing one M
 ## Shared Standards
 
 - [Claude Code Depth Standard](depth-standard.md)
+- [Publishing Workflow](publishing-workflow.md)
 
 ## Notes
 
