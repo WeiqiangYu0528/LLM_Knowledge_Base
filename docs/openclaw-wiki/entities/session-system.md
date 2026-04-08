@@ -2,65 +2,120 @@
 
 ## Overview
 
-The session system provides the identity and persistence layer that lets OpenClaw feel continuous across channels, routes, jobs, and devices. It defines session IDs, transcript events, lifecycle notifications, provenance fields, send policy, and the session keys that sit between user-facing conversations and gateway-owned runtime state.
+The session system provides the identity and persistence layer that connects a user conversation across channel reconnects, gateway restarts, and route changes. A session is identified by a structured string key (`agent:<agentId>:<rest>`) and tracks the transcript, send policy, lifecycle events, and provenance of a running or paused agent interaction. Sessions are not a storage system themselves — the gateway owns the actual SQLite/file-backed store — but the session system defines the key schema, lifecycle event protocol, label helpers, and send policy engine that the rest of the runtime depends on.
 
-Sessions anchor transcript, send policy, and provenance boundaries across channels and automation.
+## Key Types
 
-In practice, this page should be read as a boundary explanation, not just a file list. Session System owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Routing System](routing-system.md), [Gateway Control Plane](gateway-control-plane.md), [Multi Channel Session Routing](../concepts/multi-channel-session-routing.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+| Type | Source | Role |
+|------|--------|------|
+| `ParsedAgentSessionKey` | `src/sessions/session-key-utils.ts` | Parsed `{ agentId, rest }` extracted from a canonical session key |
+| `SessionLifecycleEvent` | `src/sessions/session-lifecycle-events.ts` | Emitted when a session starts, resumes, or ends |
+| `SessionSendPolicyDecision` | `src/sessions/send-policy.ts` | `"allow" \| "deny"` — whether outbound sends are permitted |
+| `SESSION_ID_RE` | `src/sessions/session-id.ts` | UUID regex for session ID validation |
 
-## Key Types / Key Concepts
+### Session Key Format
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/sessions/session-id.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/sessions/session-lifecycle-events.ts`, `src/sessions/transcript-events.ts`, `src/sessions/input-provenance.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Session ID validation helper; Lifecycle event contracts for session creation and teardown; Transcript mutation/update event stream; Provenance information for session inputs |
-| Extension or policy points | The main extension or gating surfaces live around `src/sessions/send-policy.ts`. |
-| Persistent effects | Session ID validation helper; Lifecycle event contracts for session creation and teardown; Transcript mutation/update event stream |
+Session keys use a colon-separated schema:
+
+```
+agent:<agentId>:<channel>:<peerKind>:<peerId>
+agent:<agentId>:cron:<jobId>:run:<runId>
+agent:<agentId>:subagent:<...>
+agent:<agentId>:acp:<...>
+```
+
+Key parsing is handled by `parseAgentSessionKey()`:
+
+```ts
+// src/sessions/session-key-utils.ts
+export function parseAgentSessionKey(
+  sessionKey: string | undefined | null,
+): ParsedAgentSessionKey | null {
+  const parts = raw.split(":").filter(Boolean);
+  if (parts.length < 3 || parts[0] !== "agent") return null;
+  return { agentId: parts[1], rest: parts.slice(2).join(":") };
+}
+```
+
+The `rest` portion encodes the session's scope. Classifier functions derive meaning from it:
+
+| Function | Pattern matched |
+|----------|----------------|
+| `isCronSessionKey()` | `rest.startsWith("cron:")` |
+| `isCronRunSessionKey()` | `rest` matches `cron:<id>:run:<id>` |
+| `isSubagentSessionKey()` | `rest.startsWith("subagent:")` or top-level `"subagent:"` prefix |
+| `isAcpSessionKey()` | `rest.startsWith("acp:")` |
+| `getSubagentDepth()` | Counts `:subagent:` segments — nesting depth |
 
 ## Architecture
 
-Session System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/sessions/session-id.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Lifecycle Events
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+Session start, resume, and end are communicated through a pub/sub bus in `src/sessions/session-lifecycle-events.ts`:
 
-For implementers, the important question is not only what Session System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+```ts
+export type SessionLifecycleEvent = {
+  sessionKey: string;
+  reason: string;
+  parentSessionKey?: string;
+  label?: string;
+  displayName?: string;
+};
 
-## Runtime Behavior
+export function onSessionLifecycleEvent(listener): () => void;
+export function emitSessionLifecycleEvent(event: SessionLifecycleEvent): void;
+```
 
-1. `sessions/session-id.ts` becomes relevant when session ID validation helper.
-2. `sessions/session-lifecycle-events.ts` becomes relevant when lifecycle event contracts for session creation and teardown.
-3. `sessions/transcript-events.ts` becomes relevant when transcript mutation/update event stream.
-4. `sessions/input-provenance.ts` becomes relevant when provenance information for session inputs.
-5. `sessions/send-policy.ts` becomes relevant when policy rules for reply delivery behavior.
-6. `sessions/model-overrides.ts` becomes relevant when session-scoped model override support.
+The gateway's `server.impl.ts` subscribes to `onSessionLifecycleEvent` at startup, forwarding events to connected Control UI clients as `EventFrame` messages. Channel plugins, cron jobs, and the ACP bridge emit lifecycle events when sessions start or close.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+### Send Policy
 
-## Variants, Boundaries, and Failure Modes
+`src/sessions/send-policy.ts` provides `SessionSendPolicyDecision` (`"allow" | "deny"`) by evaluating per-session `openclaw.yml` `send-policy` entries against the current session key. The policy engine strips session key prefixes, derives channel and chat type from the key structure, and matches against configured session entries:
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+```ts
+export function normalizeSendPolicy(raw?: string | null): SessionSendPolicyDecision | undefined;
+```
 
-The main extension and failure surfaces are concentrated around `src/sessions/send-policy.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+Send policy prevents a denied session from emitting outbound messages even if the agent produces output — used for read-only monitoring modes or staging environments.
+
+### Transcript Events
+
+`src/sessions/transcript-events.ts` defines the event bus for transcript updates (agent messages, tool calls, user messages). The gateway subscribes at startup to broadcast these as streaming events to connected subscribers.
+
+### Session Label and Display Name
+
+`src/sessions/session-label.ts` resolves a human-readable label for a session, used in the Control UI and logging. Labels are derived from peer information (user display names) and fall back to the raw session key.
+
+### Provenance
+
+`src/sessions/input-provenance.ts` carries the provenance of a session's input — which client, device, or channel initiated a given interaction. This is used for audit logging and rate-limiting decisions.
+
+## Session ID vs Session Key
+
+These are different:
+
+- **Session Key** — structured routing/isolation key, e.g. `agent:main:discord:direct:123456`. Determines which agent owns the conversation and how it is stored.
+- **Session ID** — a UUID assigned by the gateway to a specific conversation run, e.g. `3f4a1b2c-...`. Session IDs are random and not structural; they appear in transcripts and webhook payloads. Validated by `SESSION_ID_RE` in `src/sessions/session-id.ts`.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/sessions/session-id.ts` | Session ID validation helper |
-| `src/sessions/session-lifecycle-events.ts` | Lifecycle event contracts for session creation and teardown |
-| `src/sessions/transcript-events.ts` | Transcript mutation/update event stream |
-| `src/sessions/input-provenance.ts` | Provenance information for session inputs |
-| `src/sessions/send-policy.ts` | Policy rules for reply delivery behavior |
-| `src/sessions/model-overrides.ts` | Session-scoped model override support |
+|------|---------|
+| `src/sessions/session-key-utils.ts` | `parseAgentSessionKey()`, key classifiers (`isCronSessionKey`, `isSubagentSessionKey`, etc.) |
+| `src/sessions/session-lifecycle-events.ts` | Pub/sub bus for session start/resume/end events |
+| `src/sessions/send-policy.ts` | `SessionSendPolicyDecision` logic — allow/deny outbound sends |
+| `src/sessions/transcript-events.ts` | Event bus for transcript content updates |
+| `src/sessions/session-id.ts` | `SESSION_ID_RE` UUID validation regex, `looksLikeSessionId()` |
+| `src/sessions/session-label.ts` | Human-readable label resolution for Control UI display |
+| `src/sessions/input-provenance.ts` | Input provenance tracking for audit and rate-limiting |
+| `src/sessions/level-overrides.ts` | Per-session logging level overrides |
+| `src/sessions/model-overrides.ts` | Per-session model override fields |
 
 ## See Also
 
-- [Routing System](routing-system.md)
-- [Gateway Control Plane](gateway-control-plane.md)
-- [Multi Channel Session Routing](../concepts/multi-channel-session-routing.md)
-- [Channel Binding and Session Identity Flow](../syntheses/channel-binding-and-session-identity-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Routing System](routing-system.md) — computes session keys before sessions run
+- [Gateway Control Plane](gateway-control-plane.md) — subscribes to session lifecycle and transcript events
+- [Automation and Cron](automation-and-cron.md) — uses cron-namespaced session keys
+- [ACP and MCP Bridges](mcp-and-acp-bridges.md) — uses ACP-namespaced session keys
+- [Interactive Session Lifecycle](../syntheses/onboarding-to-live-gateway-flow.md)
+- [Multi-Channel Session Routing](../concepts/multi-channel-session-routing.md)

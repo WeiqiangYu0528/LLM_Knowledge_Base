@@ -1,69 +1,89 @@
-# Local First Personal Assistant Architecture
+# Local-First Personal Assistant Architecture
 
 ## Overview
 
-OpenClaw is organized around the idea that a personal assistant should run on the user's own devices and accounts rather than primarily inside a hosted SaaS shell. That principle shapes the gateway, node pairing, channel integrations, companion apps, and the filesystem-heavy setup model.
-
-This concept is a platform invariant. It explains why the gateway, routing, plugins, channels, and clients can evolve independently without collapsing into contradictory behavior. Local First Personal Assistant Architecture is therefore best read as a mechanism with operational consequences, not merely a label for related features.
+OpenClaw is designed to run on the user's own devices and accounts rather than primarily inside a hosted SaaS shell. The gateway runs as a local process, channel integrations use the user's own bot credentials, the model communicates directly with AI providers using the user's own API keys, and native apps connect directly to the local gateway without relaying through a third-party cloud. This architecture shapes nearly every design decision: the filesystem-first configuration model, the local `openclaw.yml` config, the keychain-based secrets storage, the node-host pairing model, and the gateway-as-control-plane invariant all reflect the premise that the user's data and conversations stay on their infrastructure.
 
 ## Why It Exists
 
-This concept exists because the OpenClaw codebase repeatedly needs a stable way to coordinate behavior across multiple entities without turning those entities into one monolith.
+The VISION.md in the repository frames this explicitly: the goal is a personal assistant that is persistent, device-aware, multi-channel, and genuinely under the user's control. A hosted SaaS model would require routing all conversations through a third-party server, which conflicts with the goal of personal control. Instead, OpenClaw runs the gateway locally and connects outward to channels and providers, rather than being a wrapper around a central service.
 
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
+This has concrete architectural consequences:
+- Auth credentials live in the OS keychain, not in a hosted database.
+- Session transcripts are stored locally in the state directory (`~/.openclaw/state/`).
+- The gateway's REST/WebSocket surface is exposed locally or via Tailscale, not via a public internet endpoint.
+- Remote exposure (`fly.toml`, `render.yaml`) exists as an option, not the default.
 
 ## Mechanism
 
-A useful way to read this mechanism is as an ordered path through the participating subsystems:
-1. A local gateway owns configuration, sessions, tools, channels, and UI surfaces.
-2. Channels and apps connect to that gateway rather than to an external monolithic service.
-3. Device or node clients extend the assistant into phones, desktops, and local execution surfaces.
-4. Plugins and skills let the assistant adapt to user-specific providers, channels, and workflows.
-5. The pattern works like this: 1.
+### Local Gateway as the Authority
 
-The steps above are the operational skeleton. The exact file names vary by subsystem, but the concept remains stable because each participating entity contributes one predictable part of the chain. That is why the same concept can show up in SDK code, CLI wiring, plugin activation, channel routing, or persistence without becoming ambiguous.
+The gateway is the user's local control plane. It starts via `openclaw gateway start` or a launchd/systemd unit, runs as a background process, and all other components (CLI, mobile apps, channels) connect to it on `localhost` or a VPN address. The gateway's `openclaw.yml` lives in the user's home directory, and its state dir (`resolveStateDir()`) holds SQLite databases, session transcripts, and exec approval records.
 
-## Invariants and Operational Implications
+### Filesystem-First Configuration
 
-The most important invariant is that the linked entities are allowed to change implementation detail without changing the high-level guarantee described here. When a change breaks that guarantee, the failure usually appears at subsystem boundaries first: a summary no longer compacts correctly, a session route stops being stable, a skill path is not loaded consistently, or a permission rule is evaluated in the wrong layer.
+All configuration is files the user can read and edit:
+- `openclaw.yml` — main config: agents, channels, bindings, plugins, model preferences
+- `~/.openclaw/skills/` — user's personal skills (markdown files)
+- `~/.openclaw/agents/<id>/agent/` — per-agent workspace
+- `~/.openclaw/plugins/` — user-installed plugins
+- `~/.openclaw/state/exec-approvals.json` — exec approval record
 
-Operationally, this means debugging should follow the mechanism rather than a UI symptom. Start where the concept is introduced, then inspect the next boundary where data, policy, or control is handed off. The source evidence table below is organized to support exactly that style of investigation.
+The CLI's wizard flow (`runSetupWizard()`) writes to these files; there is no remote config store. `CLAUDE.md` and `AGENTS.md` in working directories follow the same filesystem-first pattern.
+
+### Direct Provider Connections
+
+The agent runtime connects directly to AI providers (Anthropic, OpenAI, etc.) using the user's own credentials. There is no OpenClaw relay in the API call path — the request goes from the gateway process to the provider's API endpoint. This means API usage appears in the user's provider dashboard, not OpenClaw's.
+
+### Device Presence Without Cloud Relay
+
+Mobile apps (iOS, Android, macOS) pair directly with the user's gateway via device token authentication. The pairing flow generates a QR code or deep link; the app authenticates with the gateway on the local network or Tailscale mesh. Once paired, the app communicates directly with the gateway — no relay through an OpenClaw cloud service.
+
+### Optional Remote Exposure
+
+For users who want gateway access outside their local network, OpenClaw supports:
+- **Tailscale** — mesh VPN integration (`startGatewayTailscaleExposure()`, `readTailscaleWhoisIdentity()`). The gateway is reachable on the Tailscale network by trusted devices.
+- **Fly.io / Render** — `fly.toml` and `render.yaml` in the repo enable deploying the gateway as a cloud process for users who want persistent remote access without a home server.
+- **Self-hosted VPS** — the gateway runs on any machine; clients point their gateway URL to it.
+
+These are deployment options, not the default.
+
+### Local Secrets Storage
+
+`src/secrets/` manages credential storage using the OS keychain (macOS Keychain, Linux SecretService, Windows Credential Manager). Provider API keys and channel OAuth tokens are stored per-credential entry keyed by provider/channel ID. `activateSecretsRuntimeSnapshot()` loads all secrets into a runtime snapshot at gateway startup, making them accessible without repeated keychain I/O.
+
+## Operational Implications
+
+- Offline operation: conversations work as long as the local gateway and AI provider API are reachable. Channel polling continues without an OpenClaw cloud dependency.
+- Data locality: transcripts and session state stay in `~/.openclaw/state/` unless the user explicitly exports or syncs them.
+- Credential sovereignty: rotating or revoking API keys happens in the user's provider dashboard; OpenClaw has no copy in a remote database.
+- Deployment flexibility: the same gateway code runs on a MacBook, a Raspberry Pi, or a cloud VM.
 
 ## Involved Entities
 
-| Entity | Role In This Concept |
-| --- | --- |
-| [Gateway as Control Plane](gateway-as-control-plane.md) | Why the gateway owns sessions, channels, tools, config, and UI surfaces |
-| [Device Augmented Agent Architecture](device-augmented-agent-architecture.md) | Nodes, canvas, apps, and device execution as agent extensions |
-| [Gateway Control Plane](../entities/gateway-control-plane.md) | Gateway server startup, auth, sessions, plugin bootstrap, and control-plane duties |
-| [Onboarding to Live Gateway Flow](../syntheses/onboarding-to-live-gateway-flow.md) | Install, configure, daemonize, and bring a live OpenClaw gateway online |
-| [Gateway As Control Plane](../concepts/gateway-as-control-plane.md) | Related page in this wiki. |
-| [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md) | Related page in this wiki. |
+- [Gateway Control Plane](../entities/gateway-control-plane.md) — local control plane implementation
+- [CLI and Onboarding](../entities/cli-and-onboarding.md) — filesystem-first setup wizard
+- [Node Host and Device Pairing](../entities/node-host-and-device-pairing.md) — direct device pairing
+- [Native Apps and Platform Clients](../entities/native-apps-and-platform-clients.md) — local-first app clients
+- [Skills Platform](../entities/skills-platform.md) — skills are local markdown files
 
 ## Source Evidence
 
-| File | Why It Matters |
-| --- | --- |
-| `src/gateway/server.impl.ts` | Main composition root for gateway startup and subsystem wiring |
-| `src/gateway/server-methods.ts` | Core control-plane method handlers |
-| `src/cli/run-main.ts` | Top-level CLI bootstrap, env normalization, and command routing |
-| `src/cli/program.ts` | Commander program construction |
-| `src/node-host/runner.ts` | Main node-host process and gateway event loop |
-| `src/node-host/invoke.ts` | Invocation handling |
+| File | Contribution |
+|------|-------------|
+| `src/config/paths.ts` | `resolveStateDir()` — local state directory resolution |
+| `openclaw.yml` (user file) | Main config file in user's home directory |
+| `src/wizard/setup.ts` | `runSetupWizard()` — writes config to local filesystem |
+| `src/secrets/runtime.ts` | `activateSecretsRuntimeSnapshot()` — local keychain access |
+| `src/gateway/server-tailscale.ts` | `startGatewayTailscaleExposure()` — Tailscale mesh integration |
+| `fly.toml`, `render.yaml` | Optional cloud deployment descriptors |
+| `src/infra/device-identity.ts` | `loadOrCreateDeviceIdentity()` — per-device identity |
+| `VISION.md` | Design intent and local-first framing |
 
 ## See Also
 
 - [Gateway as Control Plane](gateway-as-control-plane.md)
-- [Device Augmented Agent Architecture](device-augmented-agent-architecture.md)
-- [Gateway Control Plane](../entities/gateway-control-plane.md)
+- [Auth and Approval Boundaries](auth-and-approval-boundaries.md)
+- [Node Host and Device Pairing](../entities/node-host-and-device-pairing.md)
 - [Onboarding to Live Gateway Flow](../syntheses/onboarding-to-live-gateway-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Device Augmented Agent Architecture](device-augmented-agent-architecture.md)

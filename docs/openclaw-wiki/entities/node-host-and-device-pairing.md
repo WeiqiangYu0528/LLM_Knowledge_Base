@@ -2,65 +2,142 @@
 
 ## Overview
 
-The node host subsystem lets OpenClaw execute commands and device actions through paired clients or remote hosts. It manages gateway connection details, device identity, execution policies, invoke payload handling, plugin-contributed host capabilities, and the paired relationship between gateway and node-like clients.
+The node host subsystem extends OpenClaw's execution reach beyond the gateway process by running as a paired client on a local or remote machine. It connects to the gateway via `GatewayClient`, registers a device identity, advertises its capabilities (including plugin-contributed commands), and then waits for invocation requests. When an agent turn calls `system.run` or another node-host command, the invocation travels from the gateway to the appropriate node host, which enforces an execution policy before running the requested operation.
 
-Paired devices and node hosts extend the assistant into the physical world under gateway-owned policy.
+Execution policy is a first-class citizen of this subsystem, not an afterthought. `ExecSecurity` and `ExecAsk` modes control whether commands are allowed, require approval, or are blocked outright. Shell wrapper invocations (`sh -c`, `bash -c`, `zsh -c`, and Windows `cmd.exe /c`) are always blocked unless explicitly approved, and the denial message includes diagnostic text to make the block reason auditable. The `OUTPUT_CAP` (200 000 bytes) and `OUTPUT_EVENT_TAIL` (20 000 bytes) constants prevent runaway processes from flooding the event stream.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Node Host and Device Pairing owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Gateway Control Plane](gateway-control-plane.md), [Canvas and Control UI](canvas-and-control-ui.md), [Device Augmented Agent Architecture](../concepts/device-augmented-agent-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+Device pairing (`src/pairing/`) manages the identity and connection lifecycle between the gateway and node-host clients including iOS, Android, and Mac native applications. The pairing layer handles pairing tokens, device identity persistence, and connection re-establishment so that the gateway always has an authoritative record of which devices are trusted for which operations.
 
-## Key Types / Key Concepts
+## Key Types
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/node-host/runner.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/node-host/invoke.ts`, `src/node-host/invoke-system-run.ts`, `src/node-host/exec-policy.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Main node-host process and gateway event loop; Invocation handling; System run invocation path; Execution policy enforcement |
-| Extension or policy points | The main extension or gating surfaces live around `src/node-host/exec-policy.ts`, `src/node-host/plugin-node-host.ts`. |
-| Persistent effects | state changes and runtime handoffs described in the cited files |
+### Runner Configuration
+
+| Type / Symbol | Location | Notes |
+|---|---|---|
+| `NodeHostRunOptions` | `src/node-host/runner.ts` | `{ gatewayHost, gatewayPort, gatewayTls?, gatewayTlsFingerprint?, nodeId?, displayName? }` — full connection options for starting a node host |
+| `NodeHostGatewayConfig` | `src/node-host/runner.ts` | Persisted config loaded from disk via `ensureNodeHostConfig()` |
+| `SkillBinsCache` | `src/node-host/runner.ts` | TTL-based binary path cache; `ttlMs = 90 000` ms; avoids repeated `which`-style lookups for skill executables |
+| `DEFAULT_NODE_PATH` | `src/node-host/runner.ts` | `"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"` — `PATH` set before command execution |
+
+**Startup helpers called by the runner:**
+
+| Function | Purpose |
+|---|---|
+| `resolveGatewayConnectionAuth()` | Retrieves auth credentials before connecting `GatewayClient` |
+| `loadOrCreateDeviceIdentity()` | Loads a persisted device identity or generates a new one; used for stable device identification across restarts |
+| `ensureNodeHostPluginRegistry()` | Initializes the plugin registry for this node host instance |
+| `listRegisteredNodeHostCapsAndCommands()` | Enumerates all capabilities and commands available on this host (including plugin contributions) to advertise to the gateway |
+
+### Invocation
+
+| Type / Symbol | Location | Notes |
+|---|---|---|
+| `NodeInvokeRequestPayload` | `src/node-host/invoke.ts` | `{ id, nodeId, command, paramsJSON?, timeoutMs?, idempotencyKey? }` — wire format for a command invocation arriving from the gateway |
+| `OUTPUT_CAP` | `src/node-host/invoke.ts` | `200 000` bytes — maximum total output captured from a command execution |
+| `OUTPUT_EVENT_TAIL` | `src/node-host/invoke.ts` | `20 000` bytes — maximum bytes sent as streaming tail events during execution |
+
+**Commands dispatched by `invoke.ts`:**
+
+| Command | Purpose |
+|---|---|
+| `system.which` | Resolves binary paths (uses `SkillBinsCache`) |
+| `system.exec-approvals-set` | Updates the approval list for a command or command pattern |
+| `system.exec-approvals-get` | Returns the current approval list |
+| `system.run` | Executes a shell command subject to execution policy |
+| `system.notify` | Sends a notification through the device's native notification channel |
+| Plugin-contributed commands | Any `OpenClawPluginNodeHostCommand` registered by installed plugins |
+
+### Execution Policy
+
+| Type / Symbol | Location | Notes |
+|---|---|---|
+| `SystemRunPolicyDecision` | `src/node-host/exec-policy.ts` | Structured allow/deny result; includes a `reason` string included in error messages on denial |
+| `ExecSecurity` | `src/node-host/exec-policy.ts` | `"deny" \| "allowlist" \| "full"` — overall security stance for command execution |
+| `ExecAsk` | `src/node-host/exec-policy.ts` | `"never" \| "on-miss" \| "always"` — whether to prompt the user for approval |
+
+Shell wrapper blocking produces a structured error with diagnostic text:
+
+```
+SYSTEM_RUN_DENIED: allowlist miss (shell wrappers like sh/bash/zsh -c require approval...)
+```
+
+The same pattern applies to Windows `cmd.exe /c`. The diagnostic text is intentionally included in the denial reason so that callers and logs can distinguish an allowlist miss from other policy failures.
+
+### Plugin Extension
+
+| Type | Location | Purpose |
+|---|---|---|
+| `OpenClawPluginNodeHostCommand` | `src/node-host/plugin-node-host.ts` | Interface that plugins implement to register additional invocable commands on a node host |
 
 ## Architecture
 
-Node Host and Device Pairing is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/node-host/runner.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Connection and Registration
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+When the node host process starts, `runner.ts` calls `resolveGatewayConnectionAuth()` to obtain gateway credentials, then opens a `GatewayClient` connection to the configured `gatewayHost:gatewayPort`. After the connection is established, `loadOrCreateDeviceIdentity()` loads or generates a stable device ID that persists across restarts. `ensureNodeHostPluginRegistry()` initializes the plugin system, and `listRegisteredNodeHostCapsAndCommands()` collects all built-in and plugin-contributed commands. This manifest is sent to the gateway, which records the node host's capabilities for routing invocation requests.
 
-For implementers, the important question is not only what Node Host and Device Pairing does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+`NodeHostGatewayConfig` (loaded from disk via `ensureNodeHostConfig()`) holds settings that survive process restarts — specifically the gateway address and any persisted approval lists. The `SkillBinsCache` avoids repeated filesystem `which` lookups by caching resolved binary paths with a 90-second TTL.
+
+### Invocation Dispatch
+
+Incoming invocation requests from the gateway arrive as `NodeInvokeRequestPayload` frames. `invoke.ts` reads the `command` field and routes to the appropriate handler. For `system.run`, the handler first calls into `exec-policy.ts` to obtain a `SystemRunPolicyDecision` before starting any subprocess. If the decision is `deny`, the invocation returns immediately with the denial reason. If the decision is `allow`, the subprocess is started with `DEFAULT_NODE_PATH` set as `PATH`; output is capped at `OUTPUT_CAP` bytes total, with streaming tail events limited to `OUTPUT_EVENT_TAIL` bytes.
+
+The `idempotencyKey` field on `NodeInvokeRequestPayload` allows the gateway to safely retry invocations on transient failures without risk of duplicate execution — the node host deduplicates requests with matching keys within the lifetime of the invocation.
+
+### Execution Policy Evaluation
+
+`exec-policy.ts` produces a `SystemRunPolicyDecision` by evaluating the requested command against the current `ExecSecurity` and `ExecAsk` configuration:
+
+- `"deny"` mode: all `system.run` calls are rejected regardless of the command.
+- `"allowlist"` mode: only commands that match an entry in the persisted approval list are allowed. Shell wrapper patterns (`sh -c`, `bash -c`, `zsh -c`, `cmd.exe /c`) are never auto-approved even if a wildcard allowlist entry would otherwise match them; they require an explicit approval entry.
+- `"full"` mode: all commands are allowed without approval.
+
+When `ExecAsk` is `"on-miss"`, a command that would otherwise be denied under `"allowlist"` mode is instead held pending user approval. The approval decision is persisted via `system.exec-approvals-set` so subsequent calls for the same command do not require re-approval.
+
+### Plugin-Contributed Commands
+
+`src/node-host/plugin-node-host.ts` defines the `OpenClawPluginNodeHostCommand` interface. Plugins implement this interface to register custom invocable commands. Registered commands are included in the capability manifest advertised to the gateway at startup and dispatched by `invoke.ts` alongside built-in system commands.
 
 ## Runtime Behavior
 
-1. `node-host/runner.ts` becomes relevant when main node-host process and gateway event loop.
-2. `node-host/invoke.ts` becomes relevant when invocation handling.
-3. `node-host/invoke-system-run.ts` becomes relevant when system run invocation path.
-4. `node-host/exec-policy.ts` becomes relevant when execution policy enforcement.
-5. `node-host/plugin-node-host.ts` becomes relevant when plugin-contributed node host capabilities.
-6. `pairing/` becomes relevant when device pairing-related flows and helpers.
+### Node Host Startup Sequence
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+1. `runner.ts` calls `resolveGatewayConnectionAuth()` to retrieve gateway credentials.
+2. `ensureNodeHostConfig()` loads `NodeHostGatewayConfig` from disk (or creates it with defaults).
+3. `loadOrCreateDeviceIdentity()` loads a persisted device UUID or generates and persists a new one.
+4. `ensureNodeHostPluginRegistry()` initializes the plugin system; plugins register their `OpenClawPluginNodeHostCommand` entries.
+5. `listRegisteredNodeHostCapsAndCommands()` collects the full command manifest (built-in + plugin-contributed).
+6. `GatewayClient.connect()` opens the connection to `gatewayHost:gatewayPort` with optional TLS and fingerprint verification.
+7. The node host sends its capability manifest to the gateway; the gateway records the device as available for routing.
+8. The `SkillBinsCache` is initialized (empty; entries are populated on first `system.which` call).
+9. The runner enters the event loop, waiting for `NodeInvokeRequestPayload` frames from the gateway.
 
-## Variants, Boundaries, and Failure Modes
+### Command Invocation: `system.run`
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
-
-The main extension and failure surfaces are concentrated around `src/node-host/exec-policy.ts`, `src/node-host/plugin-node-host.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+1. A `NodeInvokeRequestPayload` with `command = "system.run"` arrives from the gateway.
+2. `invoke.ts` parses `paramsJSON` and extracts the command string and environment.
+3. `exec-policy.ts` is called; it produces a `SystemRunPolicyDecision`.
+   - If `ExecSecurity = "deny"`: returns denial immediately with reason.
+   - If command is a shell wrapper (`sh/bash/zsh -c` or `cmd.exe /c`) and no explicit approval exists: returns `SYSTEM_RUN_DENIED` with diagnostic text.
+   - If `ExecSecurity = "allowlist"` and no match: returns denial, or triggers an approval request if `ExecAsk = "on-miss"`.
+   - If `ExecSecurity = "full"` or an allowlist match exists: decision is `allow`.
+4. If allowed, a subprocess is spawned with `DEFAULT_NODE_PATH` set as `PATH` and `timeoutMs` enforced.
+5. Output is streamed back as events, capped at `OUTPUT_EVENT_TAIL = 20 000` bytes per tail event. Total output is capped at `OUTPUT_CAP = 200 000` bytes.
+6. On process exit, the final result (exit code, truncation flag if applicable) is returned to the gateway as the invocation response.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/node-host/runner.ts` | Main node-host process and gateway event loop |
-| `src/node-host/invoke.ts` | Invocation handling |
-| `src/node-host/invoke-system-run.ts` | System run invocation path |
-| `src/node-host/exec-policy.ts` | Execution policy enforcement |
-| `src/node-host/plugin-node-host.ts` | Plugin-contributed node host capabilities |
-| `src/pairing/` | Device pairing-related flows and helpers |
+|---|---|
+| `src/node-host/runner.ts` | `NodeHostRunOptions`; `NodeHostGatewayConfig` loading; device identity; plugin registry; `SkillBinsCache`; gateway event loop |
+| `src/node-host/invoke.ts` | `NodeInvokeRequestPayload`; command dispatch table; `OUTPUT_CAP`; `OUTPUT_EVENT_TAIL` |
+| `src/node-host/exec-policy.ts` | `SystemRunPolicyDecision`; `ExecSecurity`; `ExecAsk`; shell wrapper blocking; policy evaluation logic |
+| `src/node-host/plugin-node-host.ts` | `OpenClawPluginNodeHostCommand` interface; plugin-contributed command registration |
+| `src/pairing/` | Device pairing tokens, identity lifecycle, and connection management between gateway and native clients |
 
 ## See Also
 
 - [Gateway Control Plane](gateway-control-plane.md)
+- [Agent Runtime](agent-runtime.md)
 - [Canvas and Control UI](canvas-and-control-ui.md)
 - [Device Augmented Agent Architecture](../concepts/device-augmented-agent-architecture.md)
 - [Canvas Voice and Device Control Loop](../syntheses/canvas-voice-and-device-control-loop.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

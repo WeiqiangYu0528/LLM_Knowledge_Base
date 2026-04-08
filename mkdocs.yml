@@ -240,6 +240,46 @@ nav:
           - Package Selection and Entrypoint Flow: autogen-wiki/syntheses/package-selection-and-entrypoint-flow.md
       - Log: autogen-wiki/log.md
       - Schema: autogen-wiki/schema.md
+  - Hermes Agent:
+      - Index: hermes-agent-wiki/index.md
+      - Summaries:
+          - Architecture Overview: hermes-agent-wiki/summaries/architecture-overview.md
+          - Codebase Map: hermes-agent-wiki/summaries/codebase-map.md
+          - Glossary: hermes-agent-wiki/summaries/glossary.md
+      - Entities:
+          - Agent Loop Runtime: hermes-agent-wiki/entities/agent-loop-runtime.md
+          - Prompt Assembly System: hermes-agent-wiki/entities/prompt-assembly-system.md
+          - Provider Runtime: hermes-agent-wiki/entities/provider-runtime.md
+          - Tool Registry and Dispatch: hermes-agent-wiki/entities/tool-registry-and-dispatch.md
+          - Terminal and Execution Environments: hermes-agent-wiki/entities/terminal-and-execution-environments.md
+          - Skills System: hermes-agent-wiki/entities/skills-system.md
+          - Memory and Learning Loop: hermes-agent-wiki/entities/memory-and-learning-loop.md
+          - Session Storage: hermes-agent-wiki/entities/session-storage.md
+          - CLI Runtime: hermes-agent-wiki/entities/cli-runtime.md
+          - Config and Profile System: hermes-agent-wiki/entities/config-and-profile-system.md
+          - Gateway Runtime: hermes-agent-wiki/entities/gateway-runtime.md
+          - Messaging Platform Adapters: hermes-agent-wiki/entities/messaging-platform-adapters.md
+          - Cron System: hermes-agent-wiki/entities/cron-system.md
+          - Plugin and Memory Provider System: hermes-agent-wiki/entities/plugin-and-memory-provider-system.md
+          - ACP Adapter: hermes-agent-wiki/entities/acp-adapter.md
+          - Research and Batch Surfaces: hermes-agent-wiki/entities/research-and-batch-surfaces.md
+      - Concepts:
+          - Self-Improving Agent Architecture: hermes-agent-wiki/concepts/self-improving-agent-architecture.md
+          - Prompt Layering and Cache Stability: hermes-agent-wiki/concepts/prompt-layering-and-cache-stability.md
+          - Toolset-Based Capability Governance: hermes-agent-wiki/concepts/toolset-based-capability-governance.md
+          - Multi-Surface Session Continuity: hermes-agent-wiki/concepts/multi-surface-session-continuity.md
+          - Environment Abstraction for Agent Execution: hermes-agent-wiki/concepts/environment-abstraction-for-agent-execution.md
+          - Cross-Session Recall and Memory Provider Pluggability: hermes-agent-wiki/concepts/cross-session-recall-and-memory-provider-pluggability.md
+          - Interruption and Human Approval Flow: hermes-agent-wiki/concepts/interruption-and-human-approval-flow.md
+      - Syntheses:
+          - CLI to Agent Loop Composition: hermes-agent-wiki/syntheses/cli-to-agent-loop-composition.md
+          - Gateway Message to Agent Reply Flow: hermes-agent-wiki/syntheses/gateway-message-to-agent-reply-flow.md
+          - Tool Call Execution and Approval Pipeline: hermes-agent-wiki/syntheses/tool-call-execution-and-approval-pipeline.md
+          - Compression Memory and Session Search Loop: hermes-agent-wiki/syntheses/compression-memory-and-session-search-loop.md
+          - Cron Delivery and Platform Routing: hermes-agent-wiki/syntheses/cron-delivery-and-platform-routing.md
+          - ACP Editor Session Bridge: hermes-agent-wiki/syntheses/acp-editor-session-bridge.md
+      - Log: hermes-agent-wiki/log.md
+      - Schema: hermes-agent-wiki/schema.md
 
 exclude_docs: |
   claude_code/

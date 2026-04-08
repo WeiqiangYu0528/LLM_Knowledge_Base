@@ -2,66 +2,110 @@
 
 ## Overview
 
-The provider and model system manages how OpenClaw discovers model backends, authenticates with them, selects primary models, and falls back across multiple auth/provider choices. This is both a plugin problem and a product problem, because providers are extension-delivered but model choice shapes the core assistant experience.
+The provider and model system manages which AI backends OpenClaw can route requests to, how those backends authenticate, and which models are available per agent or session. Providers are delivered as plugins; the provider runtime activates them, manages their auth state, and exposes them to the agent runtime for model selection. The model catalog (`src/agents/model-catalog.ts`) aggregates available models from all active providers and the Pi SDK's model registry.
 
-Provider selection is mediated through plugins, auth choices, allowlists, and failover rules rather than hardcoded model calls.
+Provider selection is not a static config lookup. At runtime, `resolveAuthChoiceModelSelectionPolicy()` (called during onboarding and config updates) chooses a preferred provider from the set of configured auth choices, consulting each provider plugin's `providerAuthChoices` manifest metadata before loading any plugin runtime. This enables cheap provider routing (e.g., recognizing a Claude API key format) without importing heavy provider SDKs.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Provider and Model System owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Plugin Platform](plugin-platform.md), [CLI and Onboarding](cli-and-onboarding.md), [Pluginized Capability Delivery](../concepts/pluginized-capability-delivery.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
+```ts
+// src/agents/model-catalog.ts
+export type ModelInputType = "text" | "image" | "document";
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/plugins/provider-catalog.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/plugins/providers.runtime.ts`, `src/plugins/provider-auth-choice.ts`, `src/plugins/provider-model-primary.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Provider inventory and catalog behavior; Runtime-facing provider assembly; Provider auth decision logic; Primary model selection helpers |
-| Extension or policy points | The main extension or gating surfaces live around `src/plugins/provider-catalog.ts`, `src/plugins/providers.runtime.ts`, `src/plugins/provider-auth-choice.ts`, `src/plugins/provider-model-primary.ts`. |
-| Persistent effects | state changes and runtime handoffs described in the cited files |
+export type ModelCatalogEntry = {
+  id: string;
+  name: string;
+  provider: string;
+  contextWindow?: number;
+  reasoning?: boolean;       // supports extended thinking
+  input?: ModelInputType[];
+};
+```
+
+```ts
+// src/plugins/manifest.ts
+export type PluginManifestModelSupport = {
+  modelPrefixes?: string[];   // cheap prefix match: "claude-", "gpt-"
+  modelPatterns?: string[];   // regex for complex model ID patterns
+};
+```
+
+Provider manifests also carry:
+- `providerAuthEnvVars` — maps provider IDs to env var names for API key detection
+- `providerAuthChoices` — structured auth option descriptions for the wizard
+- `autoEnableWhenConfiguredProviders` — auto-activates plugin when trigger provider appears in config
 
 ## Architecture
 
-Provider and Model System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/plugins/provider-catalog.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Manifest-Level Routing
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+Before any provider plugin is loaded, the manifest registry provides cheap metadata for model ID resolution:
+- `modelPrefixes` — e.g., `["claude-"]` lets OpenClaw route `claude-sonnet-4-6` to the Anthropic plugin without booting it.
+- `modelPatterns` — regex patterns for model IDs that don't fit a simple prefix.
 
-For implementers, the important question is not only what Provider and Model System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+This enables the runtime to identify which provider owns a model shorthand (e.g., `gpt-5.4`, `claude-opus-4-6`) at routing time, before incurring plugin startup cost.
 
-## Runtime Behavior
+### Model Catalog
 
-1. `plugins/provider-catalog.ts` becomes relevant when provider inventory and catalog behavior.
-2. `plugins/providers.runtime.ts` becomes relevant when runtime-facing provider assembly.
-3. `plugins/provider-auth-choice.ts` becomes relevant when provider auth decision logic.
-4. `plugins/provider-model-primary.ts` becomes relevant when primary model selection helpers.
-5. `plugins/provider-model-allowlist.ts` becomes relevant when model allowlist/compatibility logic.
-6. `plugins/provider-openai-codex-oauth.ts` becomes relevant when example provider-specific OAuth integration.
+`buildModelCatalog()` in `src/agents/model-catalog.ts`:
+1. Calls `augmentModelCatalogWithProviderPlugins()` — each active provider plugin's `listModels()` contributes entries.
+2. Overlays models from `models.json` in the agent directory (user-defined overrides).
+3. Filters via model suppression (`src/agents/model-suppression.runtime.ts`) to hide models not applicable for the current configuration.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+The catalog is built lazily (`modelCatalogPromise`) and shared across the gateway session. Non-Pi-native providers (`deepseek`, `kilocode`, `ollama`) use a separate code path tracked in `NON_PI_NATIVE_MODEL_PROVIDERS`.
 
-## Variants, Boundaries, and Failure Modes
+### Auth System
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+Provider authentication is layered:
 
-The main extension and failure surfaces are concentrated around `src/plugins/provider-catalog.ts`, `src/plugins/providers.runtime.ts`, `src/plugins/provider-auth-choice.ts`, `src/plugins/provider-model-primary.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+| Auth Method | Source | Notes |
+|-------------|--------|-------|
+| API key (env) | `providerAuthEnvVars` manifest | Detected without loading plugin |
+| API key (keychain) | `src/agents/auth-profiles.ts` | Named profile, stored in OS keychain |
+| OAuth | `src/plugins/provider-oauth-flow.ts` | Browser-based flow; tokens in secrets store |
+| Key rotation | `src/agents/api-key-rotation.ts` | Key pool cycling for high-throughput |
+| Auth profiles | `src/agents/auth-profiles.ts` | Named multi-provider configurations |
+
+`src/plugins/provider-auth-choice.ts` manages which auth option was selected and persists that preference for future sessions.
+
+### Provider Discovery
+
+`discoverProviders()` in `src/plugins/provider-discovery.ts` scans for provider plugins. Providers with `enabledByDefault: true` activate without explicit config. Providers with `autoEnableWhenConfiguredProviders` auto-enable when their trigger providers appear in auth config.
+
+### Model Selection at Runtime
+
+When the agent runtime constructs a request:
+1. `resolveSessionAgentIds()` identifies the agent.
+2. The agent's `model` config field specifies a model ID or shorthand (e.g., `claude-sonnet-4-6`).
+3. The provider is resolved using manifest `modelPrefixes` or the explicit `provider` field.
+4. The provider plugin's `resolveModel()` produces a fully-qualified model reference.
+5. `resolveAgentModelFallbackValues()` applies configured defaults when the model field is absent.
+
+### Thinking and Reasoning
+
+Models marked `reasoning: true` in the catalog support extended thinking. Agents with `thinkingDefault: true` or `reasoningDefault: true` in config enable model-side reasoning. `src/agents/provider-request-config.ts` attaches thinking parameters to the API request payload.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/plugins/provider-catalog.ts` | Provider inventory and catalog behavior |
-| `src/plugins/providers.runtime.ts` | Runtime-facing provider assembly |
-| `src/plugins/provider-auth-choice.ts` | Provider auth decision logic |
-| `src/plugins/provider-model-primary.ts` | Primary model selection helpers |
-| `src/plugins/provider-model-allowlist.ts` | Model allowlist/compatibility logic |
-| `src/plugins/provider-openai-codex-oauth.ts` | Example provider-specific OAuth integration |
-| `extensions/` | Concrete provider plugin packages such as OpenAI, Anthropic, Ollama, and OpenRouter |
+|------|---------|
+| `src/agents/model-catalog.ts` | `ModelCatalogEntry`, `buildModelCatalog()`, provider augmentation |
+| `src/agents/model-suppression.runtime.ts` | Hides non-applicable models from catalog |
+| `src/agents/api-key-rotation.ts` | Key pool rotation for high-throughput configurations |
+| `src/agents/auth-profiles.ts` | Named auth profile management |
+| `src/agents/provider-request-config.ts` | Builds provider-level request params including thinking |
+| `src/plugins/provider-runtime.ts` | Provider plugin activation; `listProviders()` |
+| `src/plugins/provider-discovery.ts` | `discoverProviders()` — scan and activate provider plugins |
+| `src/plugins/provider-auth-choice.ts` | Auth choice selection and preference persistence |
+| `src/plugins/provider-auth-choices.ts` | `ProviderAuthChoice` type; structured auth option definitions |
+| `src/plugins/provider-model-defaults.ts` | Default model selection helpers |
+| `src/plugins/provider-oauth-flow.ts` | OAuth browser flow for provider authentication |
+| `src/plugins/manifest.ts` | `PluginManifestModelSupport`, `providerAuthEnvVars`, manifest metadata |
 
 ## See Also
 
-- [Plugin Platform](plugin-platform.md)
-- [CLI and Onboarding](cli-and-onboarding.md)
-- [Pluginized Capability Delivery](../concepts/pluginized-capability-delivery.md)
+- [Plugin Platform](plugin-platform.md) — providers are registered as plugins
+- [Agent Runtime](agent-runtime.md) — consumes model catalog and provider auth for API calls
+- [CLI and Onboarding](cli-and-onboarding.md) — wizard uses auth choices during setup
+- [Tool-Augmented Agent Execution](../concepts/tool-augmented-agent-execution.md)
 - [Extension to Runtime Capability Flow](../syntheses/extension-to-runtime-capability-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

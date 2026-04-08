@@ -2,64 +2,165 @@
 
 ## Overview
 
-The agent runtime is the execution core that turns OpenClaw from a messaging gateway into an assistant. It manages prompts, tools, sandbox edges, embedded runners, agent-scoped workspaces, and the Pi-oriented runtime modes referenced throughout the repo and docs.
+The agent runtime is the execution core that transforms OpenClaw from a messaging gateway into an AI assistant. It owns agent configuration resolution (`agent-scope.ts`), per-agent workspace directories, skill loading and filtering, bash/process tool creation, embedded Pi runner integration, subagent tracking, and the Anthropic API transport layer. Routing hands off a `ResolvedAgentRoute` to the agent runtime; the runtime resolves agent config, loads tools and skills, and launches a reply-generation loop that produces the assistant's output.
 
-The agent runtime sits inside a broader platform, so model calls, tools, and compaction are constrained by channel, gateway, and plugin policy.
+## Key Types
 
-In practice, this page should be read as a boundary explanation, not just a file list. Agent Runtime owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Session System](session-system.md), [Skills Platform](skills-platform.md), [Local First Personal Assistant Architecture](../concepts/local-first-personal-assistant-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+| Type | Source | Role |
+|------|--------|------|
+| `ResolvedAgentConfig` | `src/agents/agent-scope.ts` | Per-agent config resolved from `openclaw.yml` |
+| `AgentEntry` | `src/agents/agent-scope.ts` | One entry from `cfg.agents.list` |
+| `AnyAgentTool` | `src/agents/tools/common.ts` | Union type for all tools; extends `AgentTool<TParameters, TResult>` |
+| `ToolInputError` | `src/agents/tools/common.ts` | Error class for malformed tool input (HTTP 400) |
+| `ToolAuthorizationError` | `src/agents/tools/common.ts` | Authorization failure (HTTP 403) |
+| `ActionGate<T>` | `src/agents/tools/common.ts` | Per-action permission flags — controls which tool operations are enabled |
 
-## Key Types / Key Concepts
+### Agent Config Shape
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/agents/agent-scope.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/agents/pi-embedded-runner/`, `src/agents/skills/refresh.ts`, `src/agents/subagent-registry.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Agent identity, default-agent, and workspace scoping helpers; Embedded runner lifecycle and run counting; Skill refresh listener registration; Subagent registry initialization |
-| Extension or policy points | The main extension or gating surfaces live around `src/agents/sandbox/`. |
-| Persistent effects | Sandbox-related runtime behavior |
+```ts
+// src/agents/agent-scope.ts
+type ResolvedAgentConfig = {
+  name?: string;
+  workspace?: string;          // agent workspace directory
+  agentDir?: string;           // agent config/skills directory
+  model?: AgentEntry["model"];
+  thinkingDefault?: boolean;
+  verboseDefault?: boolean;
+  reasoningDefault?: boolean;
+  fastModeDefault?: boolean;
+  skills?: AgentEntry["skills"]; // skill filter list
+  memorySearch?: boolean;
+  humanDelay?: AgentEntry["humanDelay"];
+  heartbeat?: AgentEntry["heartbeat"];
+  identity?: AgentEntry["identity"];
+  groupChat?: AgentEntry["groupChat"];
+  subagents?: AgentEntry["subagents"];
+  sandbox?: AgentEntry["sandbox"];
+  tools?: AgentEntry["tools"];
+};
+```
 
 ## Architecture
 
-Agent Runtime is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/agents/agent-scope.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Agent Resolution
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+`resolveDefaultAgentId(cfg)` returns the agent marked `default: true` in `openclaw.yml`, or the first agent entry if none is marked, or `"main"` if the list is empty. Multiple `default: true` entries log a warning and use the first.
 
-For implementers, the important question is not only what Agent Runtime does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+`resolveSessionAgentIds({ sessionKey, config, agentId })` extracts the `agentId` from a structured session key (e.g., `agent:coder:discord:direct:...` → `agentId = "coder"`), with an explicit override taking precedence over the session key.
 
-## Runtime Behavior
+Agent directory resolution follows a priority chain in `src/agents/agent-paths.ts`:
+1. `OPENCLAW_AGENT_DIR` env var (or legacy `PI_CODING_AGENT_DIR`)
+2. `~/.openclaw/state/agents/<agentId>/agent/`
 
-1. `agents/agent-scope.ts` becomes relevant when agent identity, default-agent, and workspace scoping helpers.
-2. `pi-embedded-runner/` becomes relevant when embedded runner lifecycle and run counting.
-3. `skills/refresh.ts` becomes relevant when skill refresh listener registration.
-4. `agents/subagent-registry.ts` becomes relevant when subagent registry initialization.
-5. `tools/` becomes relevant when agent-facing tool integrations.
-6. `sandbox/` becomes relevant when sandbox-related runtime behavior.
+### Skill Filtering
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+Each agent can have an explicit `skills` filter list in config:
 
-## Variants, Boundaries, and Failure Modes
+```ts
+// src/agents/skills/agent-filter.ts
+export function resolveEffectiveAgentSkillFilter(
+  cfg: OpenClawConfig | undefined,
+  agentId: string | undefined,
+): string[] | undefined {
+  // Per-agent skills win; fall back to cfg.agents.defaults.skills
+}
+```
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+An empty array means "no skills". `undefined` means "use global defaults". The filter is applied by `src/agents/skills/local-loader.ts` when loading skill markdown files from the agent's `skills/` directory.
 
-The main extension and failure surfaces are concentrated around `src/agents/sandbox/`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Skills System
+
+Skills are markdown files (`*.md`) in `skills/`, `~/.openclaw/skills/`, or plugin-contributed paths, with YAML frontmatter:
+
+```ts
+// src/agents/skills/types.ts
+export type OpenClawSkillMetadata = {
+  always?: boolean;          // inject unconditionally into every prompt
+  skillKey?: string;
+  primaryEnv?: string;
+  emoji?: string;
+  os?: string[];
+  requires?: {
+    bins?: string[];         // must-have binaries
+    anyBins?: string[];      // at-least-one-of binaries
+    env?: string[];
+    config?: string[];
+  };
+  install?: SkillInstallSpec[];  // auto-install specs: brew, npm, go, uv, download
+};
+
+export type SkillInvocationPolicy = {
+  userInvocable: boolean;
+  disableModelInvocation: boolean;
+};
+```
+
+`SkillInstallSpec` supports installing skill prerequisites via `brew`, `node` (npm), `go`, `uv`, or direct `download`.
+
+### Bash and Process Tools
+
+The bash tool system (`src/agents/bash-tools.*`) is the primary execution surface. It splits across several files:
+
+| File | Role |
+|------|------|
+| `bash-tools.exec.ts` | `execTool` — sandboxed command execution with approval integration |
+| `bash-tools.process.ts` | `processTool` — long-running process management |
+| `bash-tools.exec-host-gateway.ts` | Exec host adapter for gateway-side execution |
+| `bash-tools.exec-host-node.ts` | Exec host adapter for node-host-side execution |
+| `bash-tools.exec-approval-request.ts` | Sends approval prompts to the client before risky commands |
+| `bash-tools.exec-approval-followup.ts` | Handles approval responses |
+
+The `ExecApprovalManager` in `src/gateway/exec-approval-manager.ts` coordinates approval state across the gateway and paired node hosts.
+
+### Anthropic Transport
+
+The Anthropic API transport lives in `src/agents/anthropic-transport-stream.ts` and handles streaming responses from the Anthropic API. `src/agents/anthropic-payload-policy.ts` controls what fields are sent and logged, and `src/agents/api-key-rotation.ts` manages rotating API keys for high-throughput configurations.
+
+### Subagent Registry
+
+`src/agents/subagent-registry.ts` (initialized by `initSubagentRegistry()` in `server.impl.ts`) tracks running subagent sessions and their parent relationships. This enables the gateway to expose subagent depth (`getSubagentDepth()`) and terminate child sessions when a parent session ends.
+
+### Embedded Pi Runner
+
+`src/agents/pi-embedded-runner/` contains the "Pi mode" embedded agent runner — a lightweight runtime that runs directly in the gateway process instead of spawning external processes. `getActiveEmbeddedRunCount()` tracks how many embedded runs are active at any moment.
+
+## Operational Flow
+
+1. Routing resolves `ResolvedAgentRoute` with `agentId` and `sessionKey`.
+2. `resolveSessionAgentIds()` confirms the agent to use.
+3. `resolveAgentWorkspaceDir()` and `resolveOpenClawAgentDir()` locate the workspace.
+4. Skills are loaded via `local-loader.ts` filtered by `resolveEffectiveAgentSkillFilter()`.
+5. Tools are assembled — bash tools, process tools, channel tools, plugin tools.
+6. The agent starts a reply loop: `anthropic-transport-stream.ts` streams the model response.
+7. Tool calls dispatch to the appropriate tool handler; results feed back into the loop.
+8. Completed reply is delivered through the outbound pipeline to the channel.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/agents/agent-scope.ts` | Agent identity, default-agent, and workspace scoping helpers |
-| `src/agents/pi-embedded-runner/` | Embedded runner lifecycle and run counting |
-| `src/agents/skills/refresh.ts` | Skill refresh listener registration |
-| `src/agents/subagent-registry.ts` | Subagent registry initialization |
-| `src/agents/tools/` | Agent-facing tool integrations |
-| `src/agents/sandbox/` | Sandbox-related runtime behavior |
+|------|---------|
+| `src/agents/agent-scope.ts` | Agent config resolution, `listAgentEntries`, `resolveDefaultAgentId`, `resolveSessionAgentIds` |
+| `src/agents/agent-paths.ts` | Agent directory resolution; `resolveOpenClawAgentDir()` |
+| `src/agents/tools/common.ts` | `AnyAgentTool`, `ToolInputError`, `ToolAuthorizationError`, `ActionGate<T>` |
+| `src/agents/bash-tools.ts` | Bash tool barrel export |
+| `src/agents/bash-tools.exec.ts` | `execTool` — sandboxed command execution |
+| `src/agents/bash-tools.process.ts` | `processTool` — long-running process |
+| `src/agents/bash-tools.exec-approval-request.ts` | Pre-execution approval prompts |
+| `src/agents/skills/agent-filter.ts` | `resolveEffectiveAgentSkillFilter()` — per-agent skill filter |
+| `src/agents/skills/frontmatter.ts` | Skill frontmatter parser |
+| `src/agents/skills/types.ts` | `OpenClawSkillMetadata`, `SkillInvocationPolicy`, `SkillInstallSpec` |
+| `src/agents/skills/local-loader.ts` | Loads skill markdown from disk |
+| `src/agents/subagent-registry.ts` | Tracks running subagent sessions |
+| `src/agents/anthropic-transport-stream.ts` | Anthropic API streaming transport |
+| `src/agents/anthropic-payload-policy.ts` | Controls payload fields and logging |
+| `src/agents/api-key-rotation.ts` | API key rotation for high-throughput use |
+| `src/agents/pi-embedded-runner/` | Embedded Pi runtime (in-process agent execution) |
 
 ## See Also
 
-- [Session System](session-system.md)
-- [Skills Platform](skills-platform.md)
-- [Local First Personal Assistant Architecture](../concepts/local-first-personal-assistant-architecture.md)
-- [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Skills Platform](skills-platform.md) — skill discovery, metadata, and prompt injection
+- [Plugin Platform](plugin-platform.md) — plugin-contributed tools and skill sources
+- [Routing System](routing-system.md) — produces `ResolvedAgentRoute` consumed here
+- [Node Host and Device Pairing](node-host-and-device-pairing.md) — remote execution host
+- [Tool-Augmented Agent Execution](../concepts/tool-augmented-agent-execution.md)
+- [Agent Customization Surface](../syntheses/extension-to-runtime-capability-flow.md)

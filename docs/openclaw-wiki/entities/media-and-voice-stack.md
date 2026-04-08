@@ -2,66 +2,154 @@
 
 ## Overview
 
-OpenClaw has a broad media stack that covers media understanding, generation, voice interaction, transcription, and TTS. The README and source layout show that image/audio/video handling and realtime voice are not minor add-ons; they are built-in product capabilities tied to channels, nodes, apps, and the assistant runtime.
+OpenClaw's media and voice stack covers four distinct capability areas: **media understanding** (attaching images, audio, video, and documents to agent context), **media generation** (image, music, video synthesis), **speech/TTS** (text-to-speech synthesis for voice notes and telephony), and **realtime voice** (bidirectional live voice bridges using WebRTC/WebSocket audio). All four areas follow the same plugin extension model: providers are registered via the plugin API, and the agent runtime selects providers based on configuration.
 
-Voice and media features are built as runtime capabilities that plug into the same assistant and channel architecture.
+The media layer handles MIME detection, codec transcoding (via `ffmpeg`), format normalization, file-based inbound roots, base64 encoding, and audio metadata. It acts as the shared I/O foundation that TTS, realtime voice, and media understanding all depend on. The `src/media/mime.ts` map covers ~30 MIME types across image (HEIC, JPEG, PNG, WebP, GIF), audio (Opus, OGG, MP3, WAV, FLAC, AAC, M4A), video (MP4, MOV), and document (PDF, JSON, ZIP) formats.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Media and Voice Stack owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Native Apps and Platform Clients](native-apps-and-platform-clients.md), [Node Host and Device Pairing](node-host-and-device-pairing.md), [Device Augmented Agent Architecture](../concepts/device-augmented-agent-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
+### Realtime Voice
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/media/` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/media-generation/`, `src/media-understanding/`, `src/realtime-transcription/` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Shared media handling utilities and payload flows; Generated media runtime support; Media interpretation pipelines; Realtime transcription support |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | state changes and runtime handoffs described in the cited files |
+```ts
+// src/realtime-voice/provider-types.ts
+export type RealtimeVoiceBridgeCallbacks = {
+  onAudio: (muLaw: Buffer) => void;     // receive audio from bridge
+  onClearAudio: () => void;             // clear audio buffer
+  onMark?: (markName: string) => void;  // media timestamp mark
+  onTranscript?: (role, text, isFinal) => void;
+  onToolCall?: (event: RealtimeVoiceToolCallEvent) => void;
+  onReady?: () => void;
+  onError?: (error: Error) => void;
+  onClose?: (reason: "completed" | "error") => void;
+};
+
+export type RealtimeVoiceBridge = {
+  connect(): Promise<void>;
+  sendAudio(audio: Buffer): void;       // send mu-law audio to provider
+  setMediaTimestamp(ts: number): void;
+  sendUserMessage?(text: string): void; // inject text turn
+};
+```
+
+Tools registered with the voice bridge follow the same JSON schema function contract as agent tools (`RealtimeVoiceTool`), enabling the model to call agent tools during a voice session.
+
+### TTS / Speech
+
+```ts
+// src/tts/provider-types.ts
+export type SpeechProviderId = string;
+export type SpeechSynthesisTarget = "audio-file" | "voice-note";
+
+export type TtsDirectiveParseResult = {
+  cleanedText: string;
+  ttsText?: string;       // override text for synthesis
+  hasDirective: boolean;
+  overrides: TtsDirectiveOverrides;
+  warnings: string[];
+};
+
+export type SpeechModelOverridePolicy = {
+  enabled: boolean;
+  allowText: boolean;
+  allowProvider: boolean;
+  allowVoice: boolean;
+  allowModelId: boolean;
+  allowVoiceSettings: boolean;
+  // ...
+};
+```
+
+TTS directives allow inline overrides embedded in the assistant's reply text (e.g., different voice, provider, or speed for a specific segment).
+
+### Media Understanding
+
+```ts
+// Conceptual shape from src/media-understanding/types.ts
+export type MediaUnderstandingProvider = {
+  id: string;
+  understand(request: MediaUnderstandingRequest): Promise<MediaUnderstandingResult>;
+};
+```
+
+Media understanding providers accept images, audio, and video and return structured descriptions that the agent can use as context.
 
 ## Architecture
 
-Media and Voice Stack is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/media/`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Media I/O Layer (`src/media/`)
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+The media module handles low-level file operations:
+- `mime.ts` — `detectMime(buffer)` using `file-type` library for magic byte detection
+- `audio.ts`, `audio-tags.ts` — audio metadata reading, format normalization
+- `ffmpeg-exec.ts` — executes `ffmpeg` for format conversion; `ffmpeg-limits.ts` caps processing time/size
+- `channel-inbound-roots.ts` — maps inbound media from channels to file system roots for safe access
+- `file-context.ts` — resolves media file paths for agent context injection
+- `base64.ts` — encodes/decodes media for API payloads
 
-For implementers, the important question is not only what Media and Voice Stack does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+### TTS Pipeline
 
-## Runtime Behavior
+1. Agent produces reply text with optional embedded TTS directives.
+2. `parseTtsDirective()` extracts `ttsText` override and `TtsDirectiveOverrides`.
+3. Active TTS provider's `synthesize()` method generates audio bytes.
+4. Audio is delivered via the channel's outbound adapter (as voice note or telephony audio).
+5. `SpeechModelOverridePolicy` gates which fields callers can override.
 
-1. `media/` becomes relevant when shared media handling utilities and payload flows.
-2. `media-generation/` becomes relevant when generated media runtime support.
-3. `media-understanding/` becomes relevant when media interpretation pipelines.
-4. `realtime-transcription/` becomes relevant when realtime transcription support.
-5. `realtime-voice/` becomes relevant when realtime voice interaction flows.
-6. `tts/` becomes relevant when text-to-speech integration layer.
+### Realtime Voice Pipeline
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+1. A channel adapter with voice capability opens a `RealtimeVoiceBridge` via the active realtime voice provider.
+2. The bridge establishes a WebSocket/WebRTC session with the provider.
+3. Inbound audio (`onAudio`) is streamed to the bridge; the provider transcribes and generates text + audio output.
+4. `onToolCall` fires when the model invokes a registered tool during the session.
+5. `onTranscript` delivers incremental and final transcription to the session.
+6. Bridge teardown via `close()` emits `onClose` with `"completed"` or `"error"`.
 
-## Variants, Boundaries, and Failure Modes
+### Realtime Transcription
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+A separate `RealtimeTranscriptionProvider` handles one-way audio-to-text (without model response generation). This is used for voice message transcription rather than interactive voice.
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Generation Providers
+
+Image, music, and video generation follow the same plugin provider pattern:
+- `ImageGenerationProvider` — `generate(request)` → image bytes/URL
+- `MusicGenerationProvider` — `generate(request)` → audio bytes/URL
+- `VideoGenerationProvider` — `generate(request)` → video bytes/URL
+
+Providers register via `api.registerImageGenerationProvider()`, `api.registerMusicGenerationProvider()`, etc. in the plugin API.
+
+### Media Understanding via Channel Inbound
+
+When a user sends a photo, audio, or video to a channel, the channel adapter passes the media through `channel-inbound-roots.ts` which:
+1. Resolves a safe filesystem root for the inbound media.
+2. Writes the file to a temp path.
+3. Returns a `FileContext` that the agent runtime can attach to its context window.
+
+MIME detection ensures the agent receives the correct type annotation (e.g., `image/jpeg` vs. `image/heic`).
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/media/` | Shared media handling utilities and payload flows |
-| `src/media-generation/` | Generated media runtime support |
-| `src/media-understanding/` | Media interpretation pipelines |
-| `src/realtime-transcription/` | Realtime transcription support |
-| `src/realtime-voice/` | Realtime voice interaction flows |
-| `src/tts/` | Text-to-speech integration layer |
-| `extensions/speech-core/, extensions/deepgram/, extensions/elevenlabs/` | Example speech/media extensions |
+|------|---------|
+| `src/media/mime.ts` | `detectMime()` — magic byte MIME detection; MIME-to-extension map |
+| `src/media/audio.ts` | Audio metadata reading and normalization |
+| `src/media/ffmpeg-exec.ts` | `ffmpeg` execution for format conversion |
+| `src/media/ffmpeg-limits.ts` | Size/time limits for ffmpeg processing |
+| `src/media/channel-inbound-roots.ts` | Safe inbound media file root resolution |
+| `src/media/file-context.ts` | Media file path resolution for agent context |
+| `src/media/base64.ts` | Media encoding for API payloads |
+| `src/tts/provider-types.ts` | `SpeechProviderId`, `TtsDirectiveParseResult`, `SpeechModelOverridePolicy` |
+| `src/tts/provider-registry.ts` | TTS provider registration and lookup |
+| `src/realtime-voice/provider-types.ts` | `RealtimeVoiceBridge`, `RealtimeVoiceBridgeCallbacks`, `RealtimeVoiceTool` |
+| `src/realtime-voice/provider-registry.ts` | Realtime voice provider registry |
+| `src/realtime-transcription/provider-types.ts` | One-way transcription provider types |
+| `src/media-understanding/types.ts` | `MediaUnderstandingProvider` interface |
+| `src/image-generation/types.ts` | `ImageGenerationProvider` interface |
+| `src/music-generation/types.ts` | `MusicGenerationProvider` interface |
+| `src/video-generation/types.ts` | `VideoGenerationProvider` interface |
 
 ## See Also
 
-- [Native Apps and Platform Clients](native-apps-and-platform-clients.md)
-- [Node Host and Device Pairing](node-host-and-device-pairing.md)
-- [Device Augmented Agent Architecture](../concepts/device-augmented-agent-architecture.md)
+- [Plugin Platform](plugin-platform.md) — providers register via the plugin API
+- [Channel Plugin Adapters](channel-plugin-adapters.md) — channel adapters deliver inbound media and dispatch TTS output
+- [Node Host and Device Pairing](node-host-and-device-pairing.md) — node host runs ffmpeg and native audio capabilities
+- [Canvas and Control UI](canvas-and-control-ui.md) — canvas surfaces media generation output
 - [Canvas Voice and Device Control Loop](../syntheses/canvas-voice-and-device-control-loop.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Device Augmented Agent Architecture](../concepts/device-augmented-agent-architecture.md)

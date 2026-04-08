@@ -11,6 +11,7 @@
 | OpenCode | Architecture knowledge base for the `opencode/` monorepo | [Open OpenCode Wiki](opencode-wiki/index.md) |
 | OpenClaw | Architecture knowledge base for the `openclaw/` assistant platform | [Open OpenClaw Wiki](openclaw-wiki/index.md) |
 | AutoGen | Architecture knowledge base for the `autogen/` ecosystem | [Open AutoGen Wiki](autogen-wiki/index.md) |
+| Hermes Agent | Architecture knowledge base for the `hermes-agent/` runtime platform | [Open Hermes Agent Wiki](hermes-agent-wiki/index.md) |
 
 ## Structure
 

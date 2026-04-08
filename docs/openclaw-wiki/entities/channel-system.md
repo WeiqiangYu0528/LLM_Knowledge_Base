@@ -2,64 +2,118 @@
 
 ## Overview
 
-The channel system defines the common abstraction for all chat and messaging surfaces that OpenClaw supports. It normalizes channel IDs and metadata, carries session envelope information, applies mention/command gating, tracks typing and status reactions, and exposes helper APIs that the rest of the runtime can use without pulling in every concrete integration implementation.
+The channel system is the boundary layer between external messaging networks and OpenClaw's internal runtime. It normalizes the identity of every supported chat surface into a canonical `ChannelId` string, provides per-channel configuration resolution, controls message ingestion via mention and command gating, and hands normalized inbound events to the routing and session subsystems. The concrete per-network implementations — Discord, Telegram, WhatsApp, iMessage, Slack, and others — live in `src/channels/plugins/` as plugin adapters, but the shared abstractions that make any channel usable without network-specific knowledge live in `src/channels/`.
 
-Channel abstractions are what make many chat networks look like one assistant runtime without erasing network-specific policy.
+The cleanest architectural statement is the registry split: `src/channels/registry.ts` handles bundled (built-in) and plugin-registered channels uniformly, while `src/channels/ids.ts` owns the frozen catalog of known channel IDs and their aliases. Routing and gateway code can call `normalizeAnyChannelId()` and `normalizeChannelId()` without knowing whether a channel is bundled or installed externally.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Channel System owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [Channel Plugin Adapters](channel-plugin-adapters.md), [Routing System](routing-system.md), [Multi Channel Session Routing](../concepts/multi-channel-session-routing.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
+| Type | Source | Role |
+|------|--------|------|
+| `ChatChannelId` | `src/channels/ids.ts` | Canonical string ID for a known bundled channel |
+| `ChannelId` | `src/channels/plugins/types.ts` | Union of built-in and plugin-registered channel IDs |
+| `ChannelMeta` | `src/channels/plugins/types.ts` | Metadata for a channel: aliases, markdown capability, etc. |
+| `ChannelMatchSource` | `src/channels/channel-config.ts` | How a config entry was matched: `"direct" \| "parent" \| "wildcard"` |
+| `ChannelEntryMatch<T>` | `src/channels/channel-config.ts` | Lookup result including matched key and fallback/wildcard sources |
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/channels/registry.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/channels/channel-config.ts`, `src/channels/mention-gating.ts`, `src/channels/command-gating.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Lightweight normalized channel lookup against active plugins; Shared channel configuration model; Mention-based activation control; Channel-specific command invocation policy |
-| Extension or policy points | The main extension or gating surfaces live around `src/channels/registry.ts`, `src/channels/channel-config.ts`, `src/channels/command-gating.ts`. |
-| Persistent effects | Channel/session association helpers |
+The channel ID catalog is built eagerly at module load time from `listChannelCatalogEntries({ origin: "bundled" })`:
+
+```ts
+// src/channels/ids.ts
+export const CHAT_CHANNEL_ORDER = Object.freeze(
+  BUNDLED_CHAT_CHANNEL_ENTRIES.map((entry) => entry.id),
+);
+export const CHAT_CHANNEL_ALIASES: Record<string, ChatChannelId> = Object.freeze(
+  Object.fromEntries(
+    BUNDLED_CHAT_CHANNEL_ENTRIES.flatMap((entry) =>
+      entry.aliases.map((alias) => [alias, entry.id] as const),
+    ),
+  ),
+);
+```
+
+This produces a frozen, order-sorted list and an alias map usable at zero cost across the codebase.
 
 ## Architecture
 
-Channel System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/channels/registry.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+The registry layer has two levels:
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+1. **Bundled channels** — resolved via `CHAT_CHANNEL_ALIASES` and `CHAT_CHANNEL_ID_SET` built from the plugin catalog at startup. `normalizeChatChannelId()` is the fast path for these.
+2. **Plugin-registered channels** — resolved at call time from `getActivePluginRegistry()?.channels`. `normalizeAnyChannelId()` tries the bundled path first, then falls back to iterating active plugin entries.
 
-For implementers, the important question is not only what Channel System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+```ts
+// src/channels/registry.ts
+export function normalizeAnyChannelId(raw?: string | null): ChannelId | null {
+  // 1. Try bundled channel IDs
+  const bundledId = normalizeChatChannelId(raw);
+  if (bundledId) return bundledId;
+  // 2. Try active plugin registry
+  const entry = findRegisteredChannelPluginEntry(normalizeChannelKey(raw) ?? "");
+  if (!entry) return null;
+  return String(entry.plugin.id ?? "").trim().toLowerCase() as ChannelId || null;
+}
+```
+
+Per-channel configuration uses a three-way fallback: exact key match → parent key match → wildcard key match:
+
+```ts
+// src/channels/channel-config.ts
+export type ChannelEntryMatch<T> = {
+  entry?: T;          // exact match
+  wildcardEntry?: T;  // wildcard fallback
+  parentEntry?: T;    // parent (thread) match
+  matchSource?: "direct" | "parent" | "wildcard";
+};
+```
+
+This pattern is used when the gateway or routing layer looks up per-channel policy (model overrides, allow-lists, command availability). The `matchSource` field lets callers know whether they got an exact result or a fallback.
 
 ## Runtime Behavior
 
-1. `channels/registry.ts` becomes relevant when lightweight normalized channel lookup against active plugins.
-2. `channels/channel-config.ts` becomes relevant when shared channel configuration model.
-3. `channels/mention-gating.ts` becomes relevant when mention-based activation control.
-4. `channels/command-gating.ts` becomes relevant when channel-specific command invocation policy.
-5. `channels/session.ts` becomes relevant when channel/session association helpers.
-6. `channels/typing.ts` becomes relevant when typing and typing-lifecycle behavior.
+**Mention gating** (`src/channels/mention-gating.ts`) controls whether the assistant activates on a given message based on whether it was mentioned, replied to, or sent in a direct context. Networks that require an `@mention` to engage the bot use this gate to silence unrelated traffic.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+**Command gating** (`src/channels/command-gating.ts`) decides whether a slash command is available in the current channel/chat context. It applies per-channel command policies so that admin commands can be restricted to direct messages or specific channels.
 
-## Variants, Boundaries, and Failure Modes
+**Inbound debounce** (`src/channels/inbound-debounce-policy.ts`) batches or rate-limits rapid inbound messages to avoid flooding the agent with partial edits or spam from fast-typing users.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+**Reply prefix** (`src/channels/reply-prefix.ts`) attaches channel-specific prefix strings to outbound replies, enabling consistent threading on networks that need explicit reply markers.
 
-The main extension and failure surfaces are concentrated around `src/channels/registry.ts`, `src/channels/channel-config.ts`, `src/channels/command-gating.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+**Session helpers** (`src/channels/conversation-binding-context.ts`, `src/channels/native-command-session-targets.ts`) translate channel-native peer identifiers into the routing layer's `RoutePeer` shape, which is then consumed by `resolveAgentRoute()` in `src/routing/resolve-route.ts`.
+
+**Account snapshot** fields (`src/channels/account-snapshot-fields.ts`, `src/channels/account-summary.ts`) define the per-account status objects pushed to Control UI clients when channel connection state changes.
+
+## Extension Points
+
+New channel networks are added as channel plugins registered in the plugin catalog. A plugin exposes a `ChannelPlugin` object with:
+- `id` — the canonical channel ID string
+- `meta.aliases` — aliases that `normalizeAnyChannelId()` accepts
+- `meta.markdownCapable` — whether markdown is rendered
+- A `gateway.startAccount(ctx)` function that the gateway's `createChannelManager()` calls to run the per-account event loop
+
+Bundled channels auto-populate `CHANNEL_IDS` and `CHAT_CHANNEL_ALIASES` at startup. External plugin channels are resolved dynamically from the active `PluginRegistry`.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/channels/registry.ts` | Lightweight normalized channel lookup against active plugins |
-| `src/channels/channel-config.ts` | Shared channel configuration model |
-| `src/channels/mention-gating.ts` | Mention-based activation control |
-| `src/channels/command-gating.ts` | Channel-specific command invocation policy |
-| `src/channels/session.ts` | Channel/session association helpers |
-| `src/channels/typing.ts` | Typing and typing-lifecycle behavior |
+|------|---------|
+| `src/channels/ids.ts` | Frozen catalog of built-in channel IDs, aliases, and sort order |
+| `src/channels/registry.ts` | Runtime lookup: `normalizeChatChannelId`, `normalizeAnyChannelId`, `normalizeChannelId` |
+| `src/channels/channel-config.ts` | Three-way config match (direct/parent/wildcard), `ChannelEntryMatch<T>` |
+| `src/channels/mention-gating.ts` | Activation policy: whether a message triggers the assistant |
+| `src/channels/command-gating.ts` | Per-channel command availability policy |
+| `src/channels/inbound-debounce-policy.ts` | Batching policy for rapid inbound messages |
+| `src/channels/reply-prefix.ts` | Outbound reply prefix construction |
+| `src/channels/chat-meta.ts` | Channel metadata helpers used by the registry |
+| `src/channels/chat-type.ts` | `ChatType` discriminator: `"direct" \| "group" \| "thread" \| ...` |
+| `src/channels/conversation-binding-context.ts` | Translates native peer IDs to `RoutePeer` |
+| `src/channels/account-snapshot-fields.ts` | Per-account status fields for Control UI snapshots |
+| `src/channels/plugins/` | Concrete per-network adapters (Discord, Telegram, WhatsApp, etc.) |
 
 ## See Also
 
-- [Channel Plugin Adapters](channel-plugin-adapters.md)
-- [Routing System](routing-system.md)
-- [Multi Channel Session Routing](../concepts/multi-channel-session-routing.md)
+- [Channel Plugin Adapters](channel-plugin-adapters.md) — concrete per-network adapter implementations
+- [Routing System](routing-system.md) — consumes normalized channel IDs and `RoutePeer`
+- [Plugin Platform](plugin-platform.md) — plugin registry that channel adapters register into
+- [Multi-Channel Session Routing](../concepts/multi-channel-session-routing.md) — routing concept
 - [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Channel Binding and Session Identity Flow](../syntheses/channel-binding-and-session-identity-flow.md)

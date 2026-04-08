@@ -2,73 +2,132 @@
 
 ## Overview
 
-The gateway is the operational center of OpenClaw. It is responsible for loading runtime configuration, authenticating control-plane clients, bootstrapping plugins, hosting sessions and channels, starting cron and auxiliary services, serving the control UI, and coordinating node/device connections. The README explicitly frames this as the real product surface: channels, apps, and agents all orbit the gateway rather than replacing it.
+The Gateway is the operational core of OpenClaw. It is a long-running process that owns all runtime state: it authenticates control-plane clients, bootstraps channel and provider plugins, manages sessions, serves the Control UI, hosts the MCP loopback server, and coordinates paired node/device connections. The README frames this explicitly — "The Gateway is just the control plane — the product is the assistant" — because channels, apps, and AI agents all orbit the gateway rather than bypassing it.
 
-The gateway owns enough runtime state that it is more accurate to call it a control plane than a web server.
+In architectural terms the Gateway is a WebSocket server that speaks a typed binary-safe frame protocol. Every client (CLI, mobile app, Control UI, channel plugin) connects by sending a `ConnectParams` frame, receives a `HelloOk` acknowledgment, and then exchanges `RequestFrame` / `ResponseFrame` / `EventFrame` messages for the lifetime of the session.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Gateway Control Plane owns a specific slice of the OpenClaw runtime, but it only makes sense in relation to neighboring systems such as [CLI and Onboarding](cli-and-onboarding.md), [Plugin Platform](plugin-platform.md), [Gateway as Control Plane](../concepts/gateway-as-control-plane.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types and Interfaces
 
-## Key Types / Key Concepts
+### Wire-protocol frames (`src/gateway/protocol/schema/frames.ts`)
 
 ```ts
-import { createChannelManager } from "./server-channels.js";
-import { buildGatewayCronService } from "./server-cron.js";
-import { loadGatewayStartupPlugins } from "./server-plugin-bootstrap.js";
-import { createGatewayRuntimeState } from "./server-runtime-state.js";
-import { attachGatewayWsHandlers } from "./server-ws-runtime.js";
+// Sent by client on connect; negotiates protocol version and carries auth.
+export const ConnectParamsSchema = Type.Object({
+  minProtocol: Type.Integer({ minimum: 1 }),
+  maxProtocol: Type.Integer({ minimum: 1 }),
+  client: Type.Object({
+    id: GatewayClientIdSchema,
+    version: NonEmptyString,
+    platform: NonEmptyString,
+    mode: GatewayClientModeSchema,
+    ...
+  }),
+  auth: Type.Optional(Type.Object({
+    token: Type.Optional(Type.String()),
+    deviceToken: Type.Optional(Type.String()),
+    ...
+  })),
+  ...
+});
+
+// Server reply after successful handshake.
+export const HelloOkSchema = Type.Object({
+  type: Type.Literal("hello-ok"),
+  protocol: Type.Integer({ minimum: 1 }),
+  server: Type.Object({ version: NonEmptyString, connId: NonEmptyString }),
+  features: Type.Object({ methods: Type.Array(NonEmptyString), events: Type.Array(NonEmptyString) }),
+  snapshot: SnapshotSchema,
+  ...
+});
+
+// All traffic is one of three discriminated frame shapes.
+export const GatewayFrameSchema = Type.Union(
+  [RequestFrameSchema, ResponseFrameSchema, EventFrameSchema],
+  { discriminator: "type" },
+);
 ```
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `src/gateway/server.impl.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `src/gateway/server-methods.ts`, `src/gateway/server-plugin-bootstrap.ts`, `src/gateway/server-channels.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Main composition root for gateway startup and subsystem wiring; Core control-plane method handlers; Startup and deferred plugin loading; Channel manager construction |
-| Extension or policy points | The main extension or gating surfaces live around `src/gateway/server-plugin-bootstrap.ts`. |
-| Persistent effects | Main composition root for gateway startup and subsystem wiring; Core control-plane method handlers; Startup and deferred plugin loading |
+`RequestFrame` carries `{ type: "req", id, method, params? }`.
+`ResponseFrame` carries `{ type: "res", id, ok, payload?, error? }`.
+`EventFrame` carries `{ type: "event", event, payload?, seq?, stateVersion? }`.
+
+### Type exports (`src/gateway/protocol/schema/types.ts`)
+
+The full typed catalogue of all Gateway methods is derived from the same TypeBox schemas:
+
+```ts
+export type ConnectParams     = SchemaType<"ConnectParams">;
+export type HelloOk           = SchemaType<"HelloOk">;
+export type RequestFrame      = SchemaType<"RequestFrame">;
+export type ResponseFrame     = SchemaType<"ResponseFrame">;
+export type EventFrame        = SchemaType<"EventFrame">;
+export type SessionsSendParams = SchemaType<"SessionsSendParams">;
+export type SessionsCreateParams = SchemaType<"SessionsCreateParams">;
+// ... plus ~60 more method-specific param/result types
+```
 
 ## Architecture
 
-Gateway Control Plane is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `src/gateway/server.impl.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+`startGatewayServer()` in `server.impl.ts` is the composition root. It:
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+1. Loads and validates `openclaw.yml` via `loadConfig()`.
+2. Resolves auth surfaces and rate-limiters.
+3. Calls `resolveGatewayStartupPluginIds()` to determine which channel and provider plugins load at startup vs. on-demand.
+4. Calls `createPluginRuntime()` and `setActivePluginRegistry()` to activate the plugin layer.
+5. Calls `createChannelManager()` (`server-channels.ts`) which starts each enabled channel account's polling/streaming loop with a supervised backoff policy (`CHANNEL_RESTART_POLICY: { initialMs: 5_000, maxMs: 5 * 60_000, factor: 2 }`).
+6. Calls `startMcpLoopbackServer()` for MCP tool integrations.
+7. Attaches WebSocket handlers via `attachGatewayWsHandlers()`.
+8. Registers method handlers via `server-methods.ts`.
 
-For implementers, the important question is not only what Gateway Control Plane does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+Channel manager state is held as a `ChannelRuntimeStore` — four maps tracking abort controllers, startup promises, live tasks, and account snapshots:
 
-## Runtime Behavior
+```ts
+type ChannelRuntimeStore = {
+  aborts:   Map<string, AbortController>;
+  starting: Map<string, Promise<void>>;
+  tasks:    Map<string, Promise<unknown>>;
+  runtimes: Map<string, ChannelAccountSnapshot>;
+};
+```
 
-1. `gateway/server.impl.ts` becomes relevant when main composition root for gateway startup and subsystem wiring.
-2. `gateway/server-methods.ts` becomes relevant when core control-plane method handlers.
-3. `gateway/server-plugin-bootstrap.ts` becomes relevant when startup and deferred plugin loading.
-4. `gateway/server-channels.ts` becomes relevant when channel manager construction.
-5. `gateway/server-ws-runtime.ts` becomes relevant when websocket attachment and runtime event serving.
-6. `gateway/server-cron.ts` becomes relevant when cron service integration into gateway startup.
+The snapshot type that accumulates across all running channels is:
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+```ts
+export type ChannelRuntimeSnapshot = {
+  channels:        Partial<Record<ChannelId, ChannelAccountSnapshot>>;
+  channelAccounts: Partial<Record<ChannelId, Record<string, ChannelAccountSnapshot>>>;
+};
+```
 
-## Variants, Boundaries, and Failure Modes
+### How channels register
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+Each channel plugin is a `ChannelPlugin` object (see `types.plugin.ts`) registered in the plugin catalog. On startup, `createChannelManager()` calls `listChannelPlugins()` to enumerate all enabled channels, then starts an account-scoped loop per configured account. The loop calls the plugin's `gateway.startAccount(ctx)` adapter — a long-running async function that receives inbound messages and emits them into the reply dispatch pipeline. The gateway wraps each loop with the supervised backoff policy so crashes restart automatically up to `MAX_RESTART_ATTEMPTS = 10`.
 
-The main extension and failure surfaces are concentrated around `src/gateway/server-plugin-bootstrap.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Request / response routing
+
+Method calls arrive as `RequestFrame` messages, are dispatched by name in `server-methods.ts`, and reply as `ResponseFrame` messages with the same `id`. Events (agent output, session updates, channel status changes) are pushed as `EventFrame` messages carrying a monotonically increasing `seq` and an optional `stateVersion` for snapshot reconciliation.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `src/gateway/server.impl.ts` | Main composition root for gateway startup and subsystem wiring |
-| `src/gateway/server-methods.ts` | Core control-plane method handlers |
+|------|---------|
+| `src/gateway/server.impl.ts` | Composition root; `startGatewayServer()` entry point |
+| `src/gateway/server.ts` | Public re-export barrel |
+| `src/gateway/server-methods.ts` | Registers all control-plane method handlers |
+| `src/gateway/server-channels.ts` | Channel manager; supervised per-account start loops |
+| `src/gateway/server-ws-runtime.ts` | WebSocket attachment and runtime event serving |
 | `src/gateway/server-plugin-bootstrap.ts` | Startup and deferred plugin loading |
-| `src/gateway/server-channels.ts` | Channel manager construction |
-| `src/gateway/server-ws-runtime.ts` | Websocket attachment and runtime event serving |
-| `src/gateway/server-cron.ts` | Cron service integration into gateway startup |
-| `src/gateway/mcp-http.ts` | Gateway-level MCP loopback startup |
+| `src/gateway/server-cron.ts` | Cron service integration |
+| `src/gateway/mcp-http.ts` | MCP loopback server startup |
+| `src/gateway/protocol/schema/frames.ts` | Wire-protocol frame schemas (`ConnectParams`, `HelloOk`, `GatewayFrame`) |
+| `src/gateway/protocol/schema/types.ts` | Derived TypeScript types for all protocol shapes |
+| `src/gateway/protocol/schema/*.ts` | Per-domain schemas (sessions, config, agents, nodes, etc.) |
+| `src/gateway/protocol/index.ts` | Validator index; runtime AJV schema compilation |
 
 ## See Also
 
-- [CLI and Onboarding](cli-and-onboarding.md)
-- [Plugin Platform](plugin-platform.md)
+- [Channel System](channel-system.md)
+- [Routing System](routing-system.md)
+- [Session System](session-system.md)
 - [Gateway as Control Plane](../concepts/gateway-as-control-plane.md)
-- [Onboarding to Live Gateway Flow](../syntheses/onboarding-to-live-gateway-flow.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)

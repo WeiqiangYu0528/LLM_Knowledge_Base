@@ -2,66 +2,93 @@
 
 ## Overview
 
-The gateway is not just a transport server. It is the local control plane that coordinates sessions, channels, plugins, auth, cron, web surfaces, and external bridges.
-
-This concept is a platform invariant. It explains why the gateway, routing, plugins, channels, and clients can evolve independently without collapsing into contradictory behavior. Gateway as Control Plane is therefore best read as a mechanism with operational consequences, not merely a label for related features.
-
-## Why It Exists
-
-This concept exists because the OpenClaw codebase repeatedly needs a stable way to coordinate behavior across multiple entities without turning those entities into one monolith.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
+The gateway is the single stateful authority for the entire OpenClaw runtime. All channels, clients, sessions, plugins, cron jobs, approvals, and external bridges connect to it — not to each other. This means the gateway is not merely a WebSocket relay; it is the policy enforcement point, the session registry, the plugin activation coordinator, and the event distribution hub. The README's statement that "The Gateway is just the control plane — the product is the assistant" captures this precisely: channels and AI providers change, but the gateway's role as coordinator remains constant.
 
 ## Mechanism
 
-A useful way to read this mechanism is as an ordered path through the participating subsystems:
-1. Gateway startup loads config, secrets, plugins, and runtime state.
-2. Channel managers, cron, node subscriptions, and websocket services are attached.
-3. Session and transcript events are observed centrally.
-4. External bridges like MCP and ACP connect through the gateway rather than bypassing it.
-5. UI and management surfaces are served from the same control-plane runtime.
+### Single Point of Authority
 
-The steps above are the operational skeleton. The exact file names vary by subsystem, but the concept remains stable because each participating entity contributes one predictable part of the chain. That is why the same concept can show up in SDK code, CLI wiring, plugin activation, channel routing, or persistence without becoming ambiguous.
+`startGatewayServer()` in `src/gateway/server.impl.ts` is the composition root for everything runtime-stateful:
 
-## Invariants and Operational Implications
+| Responsibility | Where |
+|----------------|-------|
+| Config loading and validation | `loadConfig()`, `applyConfigOverrides()` |
+| Plugin registry construction and activation | `loadGatewayStartupPlugins()`, `setActivePluginRegistry()` |
+| Channel manager startup | `createChannelManager()` — supervised per-account loops |
+| Auth surface evaluation | `evaluateGatewayAuthSurfaceStates()` |
+| Session lifecycle tracking | `onSessionLifecycleEvent()` subscribers |
+| Cron service integration | `buildGatewayCronService()` |
+| MCP loopback server | `startMcpLoopbackServer()` |
+| Node/device registry | `NodeRegistry` |
+| WebSocket handler attachment | `attachGatewayWsHandlers()` |
+| Method handler registration | `coreGatewayHandlers` + plugin handlers |
+| Control UI serving | `handleControlUiRequest()` |
 
-The most important invariant is that the linked entities are allowed to change implementation detail without changing the high-level guarantee described here. When a change breaks that guarantee, the failure usually appears at subsystem boundaries first: a summary no longer compacts correctly, a session route stops being stable, a skill path is not loaded consistently, or a permission rule is evaluated in the wrong layer.
+No other subsystem holds equivalent authority. Channel plugins, ACP/MCP bridges, and CLI clients all acquire capabilities by calling gateway methods over the WebSocket protocol.
 
-Operationally, this means debugging should follow the mechanism rather than a UI symptom. Start where the concept is introduced, then inspect the next boundary where data, policy, or control is handed off. The source evidence table below is organized to support exactly that style of investigation.
+### WebSocket Frame Protocol
+
+Every client — CLI, mobile app, Control UI, ACP bridge — speaks the same protocol:
+
+```
+ConnectParams → HelloOk (snapshot of current state)
+RequestFrame (method call) ↔ ResponseFrame (result or error)
+EventFrame (push: session events, agent output, channel status)
+```
+
+The `features.methods` array in `HelloOk` declares which gateway methods are available, allowing clients to degrade gracefully when running against older gateway versions.
+
+### Config Reload Without Restart
+
+`startGatewayConfigReloader()` watches `openclaw.yml` for changes. On change, it:
+1. Re-loads and validates config.
+2. Re-evaluates auth surface states.
+3. Re-activates the plugin registry (with optional deferred channel loading).
+4. Updates channel manager state for any added/removed accounts.
+
+Clients receive an `EventFrame` with `GATEWAY_EVENT_UPDATE_AVAILABLE` when config changes affect visible state.
+
+### Secrets and Auth Surface Management
+
+`GATEWAY_AUTH_SURFACE_PATHS` defines the paths and their auth requirements. `evaluateGatewayAuthSurfaceStates()` computes which surfaces need tokens, passwords, or Tailscale at startup and on reload. The rate limiter (`createAuthRateLimiter()`) guards auth endpoints against brute force.
+
+### Heartbeat and Health
+
+`startHeartbeatRunner()` drives periodic heartbeat events. Channel plugins can declare `ChannelHeartbeatAdapter` to receive wakeup events for polling-based channels. `onHeartbeatEvent()` subscribers in the gateway keep maintenance timers and stale-session reaping running.
+
+## Invariants
+
+1. **All sessions are gateway-owned.** No client persists session state independently.
+2. **All plugin registrations go through the gateway.** Plugins cannot inject behavior into agent execution without being in the active registry.
+3. **All method access is gated by auth.** `ResolvedGatewayAuth` is evaluated on every WebSocket handshake; device tokens are validated by `device-auth.ts`.
+4. **Event ordering is guaranteed within a connection.** `seq` on `EventFrame` increments monotonically; clients can detect missed events.
 
 ## Involved Entities
 
-| Entity | Role In This Concept |
-| --- | --- |
-| [Local First Personal Assistant Architecture](local-first-personal-assistant-architecture.md) | OpenClaw as a user-owned assistant centered on a local gateway |
-| [Pluginized Capability Delivery](pluginized-capability-delivery.md) | Providers, channels, and tools delivered through plugin activation |
-| [Gateway Control Plane](../entities/gateway-control-plane.md) | Gateway server startup, auth, sessions, plugin bootstrap, and control-plane duties |
-| [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md) | End-to-end flow from channel ingress through routing, session, agent, and reply dispatch |
-| [Architecture Overview](../summaries/architecture-overview.md) | High-level orientation to OpenClaw as a local-first personal assistant platform |
-| [Codebase Map](../summaries/codebase-map.md) | Maps `src/`, `extensions/`, `apps/`, `skills/`, and `docs/` to the corresponding wiki pages |
+- [Gateway Control Plane](../entities/gateway-control-plane.md) — the concrete implementation
+- [Plugin Platform](../entities/plugin-platform.md) — activated and managed by the gateway
+- [Channel System](../entities/channel-system.md) — channel accounts started by the gateway
+- [Session System](../entities/session-system.md) — session events subscribed by the gateway
+- [Automation and Cron](../entities/automation-and-cron.md) — cron service integrated into gateway startup
 
 ## Source Evidence
 
-| File | Why It Matters |
-| --- | --- |
-| `src/gateway/server.impl.ts` | Main composition root for gateway startup and subsystem wiring |
-| `src/gateway/server-methods.ts` | Core control-plane method handlers |
-| `src/plugins/loader.ts` | Central discovery, load, validation, and activation path |
-| `src/plugins/runtime.ts` | Active registry lifecycle and runtime state |
-| `src/sessions/session-id.ts` | Session ID validation helper |
-| `src/sessions/session-lifecycle-events.ts` | Lifecycle event contracts for session creation and teardown |
+| File | Contribution |
+|------|-------------|
+| `src/gateway/server.impl.ts` | `startGatewayServer()` — full composition root |
+| `src/gateway/auth.ts` | `ResolvedGatewayAuth`, `GatewayAuthResult`, auth modes |
+| `src/gateway/server-methods.ts` | `coreGatewayHandlers` — all method registrations |
+| `src/gateway/server-ws-runtime.ts` | `attachGatewayWsHandlers()` — WebSocket binding |
+| `src/gateway/config-reload.ts` | `startGatewayConfigReloader()` — hot-reload loop |
+| `src/gateway/server-channels.ts` | `createChannelManager()` — supervised channel account loops |
+| `src/gateway/node-registry.ts` | `NodeRegistry` — paired device tracking |
+| `src/secrets/runtime-gateway-auth-surfaces.ts` | `GATEWAY_AUTH_SURFACE_PATHS`, `evaluateGatewayAuthSurfaceStates()` |
+| `src/gateway/protocol/schema/frames.ts` | `ConnectParams`, `HelloOk`, `GatewayFrame` wire schemas |
 
 ## See Also
 
-- [Local First Personal Assistant Architecture](local-first-personal-assistant-architecture.md)
-- [Pluginized Capability Delivery](pluginized-capability-delivery.md)
 - [Gateway Control Plane](../entities/gateway-control-plane.md)
+- [Plugin Platform](../entities/plugin-platform.md)
+- [Multi-Channel Session Routing](multi-channel-session-routing.md)
 - [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Onboarding to Live Gateway Flow](../syntheses/onboarding-to-live-gateway-flow.md)

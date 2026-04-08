@@ -1,69 +1,128 @@
-# Multi Channel Session Routing
+# Multi-Channel Session Routing
 
 ## Overview
 
-OpenClaw's routing model exists because one assistant can appear across many channels, accounts, peers, and group contexts. The platform therefore needs a deterministic way to map inbound traffic into isolated agent/session lanes.
+OpenClaw's routing model maps inbound traffic — which can arrive from Discord, Telegram, iMessage, WhatsApp, Slack, or any plugin-registered channel — to a specific agent and a specific session. Without routing, a single gateway serving multiple channels would either merge all conversations into one transcript or require one gateway per channel. Instead, the routing system applies a priority-ordered set of binding rules that produce a deterministic `(agentId, sessionKey)` pair for every inbound message, regardless of which channel it arrived on.
 
-This concept is a platform invariant. It explains why the gateway, routing, plugins, channels, and clients can evolve independently without collapsing into contradictory behavior. Multi Channel Session Routing is therefore best read as a mechanism with operational consequences, not merely a label for related features.
-
-## Why It Exists
-
-This concept exists because the OpenClaw codebase repeatedly needs a stable way to coordinate behavior across multiple entities without turning those entities into one monolith.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenClaw, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
+The routing model is how multi-agent, multi-channel deployment becomes possible without a separate process per agent or channel. One gateway can host multiple named agents (e.g., `main`, `coder`, `bot-for-team-a`), each receiving only the traffic their bindings claim, with session isolation enforced by the session key's structure.
 
 ## Mechanism
 
-A useful way to read this mechanism is as an ordered path through the participating subsystems:
-1. Normalize channel and account information.
-2. Evaluate bindings, peer wildcards, guild/team scope, and role-sensitive rules.
-3. Resolve the effective `agentId` and `accountId`.
-4. Construct `sessionKey` and `mainSessionKey`.
-5. Hand the resolved route to session, transcript, and reply systems.
+### Route Resolution
 
-The steps above are the operational skeleton. The exact file names vary by subsystem, but the concept remains stable because each participating entity contributes one predictable part of the chain. That is why the same concept can show up in SDK code, CLI wiring, plugin activation, channel routing, or persistence without becoming ambiguous.
+Every inbound message passes through `resolveAgentRoute()` in `src/routing/resolve-route.ts`. The function receives:
 
-## Invariants and Operational Implications
+```ts
+{
+  cfg: OpenClawConfig,    // full config with bindings
+  channel: string,        // normalized channel ID
+  accountId?: string,     // channel account (e.g., bot account ID)
+  peer?: RoutePeer,       // { kind: ChatType, id: string }
+  parentPeer?: RoutePeer, // thread parent, for inheritance
+  guildId?: string,       // Discord server ID
+  teamId?: string,        // Slack/Teams workspace ID
+  memberRoleIds?: string[], // Discord role IDs
+}
+```
 
-The most important invariant is that the linked entities are allowed to change implementation detail without changing the high-level guarantee described here. When a change breaks that guarantee, the failure usually appears at subsystem boundaries first: a summary no longer compacts correctly, a session route stops being stable, a skill path is not loaded consistently, or a permission rule is evaluated in the wrong layer.
+It walks bindings in descending specificity order:
 
-Operationally, this means debugging should follow the mechanism rather than a UI symptom. Start where the concept is introduced, then inspect the next boundary where data, policy, or control is handed off. The source evidence table below is organized to support exactly that style of investigation.
+1. `binding.peer` — exact peer ID match
+2. `binding.peer.parent` — parent peer (thread inherits parent's binding)
+3. `binding.peer.wildcard` — wildcard peer in the binding
+4. `binding.guild+roles` — Discord guild with required role membership
+5. `binding.guild` — Discord guild only
+6. `binding.team` — Slack/Teams workspace
+7. `binding.account` — channel account ID
+8. `binding.channel` — channel ID only
+9. `default` — `resolveDefaultAgentId(cfg)`
+
+The first matching rule wins. `matchedBy` in the result carries the match reason for debug logging.
+
+### Session Key Construction
+
+After routing selects an `agentId`, `buildAgentSessionKey()` encodes the isolation dimensions into a string:
+
+```
+agent:<agentId>:<channel>:<peerKind>:<peerId>    ← per-peer scope
+agent:<agentId>:main                              ← collapsed DM scope
+agent:<agentId>:cron:<jobId>:run:<runId>          ← cron scope
+agent:<agentId>:acp:<...>                         ← ACP scope
+```
+
+The `dmScope` parameter on `buildAgentSessionKey()` controls how DM threads collapse:
+- `"main"` — all DMs share one transcript (simplest, used for personal assistants)
+- `"per-peer"` — each user gets their own session
+- `"per-channel-peer"` — per (channel, user) pair
+- `"per-account-channel-peer"` — most granular: per (account, channel, user) triple
+
+### Last-Route Tracking
+
+`lastRoutePolicy` in `ResolvedAgentRoute` tells the runtime which key to update when a new interaction arrives:
+- `"main"` — update the main session key's last-route pointer (used when `sessionKey === mainSessionKey`)
+- `"session"` — update the per-peer session key (used when the session is scoped to a specific peer)
+
+This enables session resume: the next inbound message from a peer finds the most recent session without a full database scan.
+
+### Bindings Configuration
+
+Bindings in `openclaw.yml` look like:
+
+```yaml
+agents:
+  bindings:
+    - match:
+        channel: discord
+        guildId: "1234567890"
+        roles: ["admin"]
+      agentId: admin-bot
+    - match:
+        channel: telegram
+        peer:
+          kind: direct
+          id: "9876543210"
+      agentId: personal-assistant
+    - match:
+        channel: slack
+        accountId: myworkspace
+      agentId: work-bot
+```
+
+`listRouteBindings(cfg)` in `src/config/bindings.ts` reads these into `AgentRouteBinding[]`.
+
+### Multi-Agent Routing
+
+Multiple agents in config means routing decisions diverge by conversation context. The `resolveDefaultAgentId(cfg)` fallback uses the first agent marked `default: true`, or the first agent entry, or `"main"`. Agents that share a `channel + accountId` binding but differ by `peer` or `guildId` get separate session keys and separate transcripts.
+
+## Operational Implications
+
+- Changing a binding after conversations have started redirects future messages to the new agent without migrating old transcripts.
+- `sessionKey === mainSessionKey` collapse is a lossy operation: per-peer isolation cannot be restored without a gateway restart + config change.
+- Role-based routing (`binding.guild+roles`) re-evaluates on every message, so users who gain or lose roles see their routing change immediately.
+- The `parentPeer` field enables threads (Discord, Slack) to inherit the binding of their parent conversation, preventing thread messages from routing to the default agent.
 
 ## Involved Entities
 
-| Entity | Role In This Concept |
-| --- | --- |
-| [Auth and Approval Boundaries](auth-and-approval-boundaries.md) | Tokens, passwords, allowlists, approvals, and safety envelopes |
-| [Routing System](../entities/routing-system.md) | Account, peer, and binding-based route resolution into agent/session targets |
-| [Session System](../entities/session-system.md) | Session identity, lifecycle, provenance, send policy, and transcript events |
-| [Channel Binding and Session Identity Flow](../syntheses/channel-binding-and-session-identity-flow.md) | How bindings, account IDs, routes, and session keys compose |
-| [Gateway As Control Plane](../concepts/gateway-as-control-plane.md) | Related page in this wiki. |
-| [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md) | Related page in this wiki. |
+- [Routing System](../entities/routing-system.md) — implements `resolveAgentRoute()` and session key construction
+- [Channel System](../entities/channel-system.md) — provides normalized channel IDs and `RoutePeer`
+- [Session System](../entities/session-system.md) — owns the session keys produced by routing
+- [Agent Runtime](../entities/agent-runtime.md) — receives the `ResolvedAgentRoute` to configure agent execution
 
 ## Source Evidence
 
-| File | Why It Matters |
-| --- | --- |
-| `src/routing/resolve-route.ts` | Main route resolution logic |
-| `src/routing/session-key.ts` | Session key construction and normalization helpers |
-| `src/sessions/session-id.ts` | Session ID validation helper |
-| `src/sessions/session-lifecycle-events.ts` | Lifecycle event contracts for session creation and teardown |
-| `src/channels/registry.ts` | Lightweight normalized channel lookup against active plugins |
-| `src/channels/channel-config.ts` | Shared channel configuration model |
+| File | Contribution |
+|------|-------------|
+| `src/routing/resolve-route.ts` | `resolveAgentRoute()`, `ResolveAgentRouteInput`, `ResolvedAgentRoute` |
+| `src/routing/session-key.ts` | `buildAgentSessionKey()`, `buildAgentMainSessionKey()` |
+| `src/routing/bindings.ts` | `listBindings()`, `listBoundAccountIds()` |
+| `src/sessions/session-key-utils.ts` | `parseAgentSessionKey()`, `isCronSessionKey()`, `getSubagentDepth()` |
+| `src/config/bindings.ts` | `listRouteBindings()` — reads bindings from config |
+| `src/channels/chat-type.ts` | `ChatType` union discriminator |
 
 ## See Also
 
-- [Auth and Approval Boundaries](auth-and-approval-boundaries.md)
 - [Routing System](../entities/routing-system.md)
 - [Session System](../entities/session-system.md)
+- [Channel System](../entities/channel-system.md)
 - [Channel Binding and Session Identity Flow](../syntheses/channel-binding-and-session-identity-flow.md)
-- [Gateway As Control Plane](../concepts/gateway-as-control-plane.md)
-- [Inbound Message To Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Inbound Message to Agent Reply Flow](../syntheses/inbound-message-to-agent-reply-flow.md)
