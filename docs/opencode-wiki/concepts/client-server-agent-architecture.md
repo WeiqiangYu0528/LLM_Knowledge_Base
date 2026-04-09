@@ -2,70 +2,71 @@
 
 ## Overview
 
-OpenCode is built around the idea that the coding agent runtime should be reachable from multiple clients. The README makes this explicit: the TUI is only one possible client, and the same engine can be driven remotely.
+OpenCode is structured as a local server process that multiple client surfaces attach to over HTTP and Server-Sent Events. Running `opencode serve` starts a Hono HTTP server; the TUI, web interface, desktop application, Slack integration, and programmatic SDK all connect to that server as thin clients. The server is the sole owner of agent state: sessions, providers, permissions, and the project instance context. Clients are display-only renderers that send requests and stream events back to the user.
 
-This concept exists because OpenCode reuses one runtime across multiple entry points. The concept page therefore needs to explain the shared mechanism that keeps those surfaces aligned. Client Server Agent Architecture is therefore best read as a mechanism with operational consequences, not merely a label for related features.
-
-## Why It Exists
-
-This concept exists because the OpenCode codebase repeatedly needs a stable way to coordinate behavior across multiple entities without turning those entities into one monolith.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenCode, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenCode, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenCode, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
-
-A concept page earns its place only when it explains a guarantee that several entities rely on. In OpenCode, this pattern keeps implementation detail from leaking across subsystem boundaries while still letting the overall product behave as one runtime.
+This design makes the agent runtime reachable from any surface without duplicating session logic. The TUI is not special — `AttachCommand` connects over the network exactly as any other client would. If the server is already running for a project directory, attaching is instant; if not, the TUI starts the server itself and then connects.
 
 ## Mechanism
 
-A useful way to read this mechanism is as an ordered path through the participating subsystems:
-1. a core runtime inside `packages/opencode/src`.
-2. a server API built with Hono.
-3. workspace-aware routing between local and remote instances.
-4. multiple client packages consuming the same runtime indirectly.
-5. The architecture emerges from several cooperating pieces: 1.
-6. a core runtime inside `packages/opencode/src` 2.
-7. a server API built with Hono 3.
-8. workspace-aware routing between local and remote instances 4.
+### Server startup
 
-The steps above are the operational skeleton. The exact file names vary by subsystem, but the concept remains stable because each participating entity contributes one predictable part of the chain. That is why the same concept can show up in SDK code, CLI wiring, plugin activation, channel routing, or persistence without becoming ambiguous.
+`ServeCommand` initializes the Hono HTTP application and registers route handlers covering sessions, providers, permissions, tools, and file operations. The server binds to a local port (default `4096`) and writes a socket file so other processes can discover it. OpenAPI schema generation happens at startup so every endpoint has a typed contract that the SDK and clients consume.
 
-## Invariants and Operational Implications
+`Instance.provide()` is called during startup with the target project directory. It canonicalizes the path via `Filesystem.resolve()`, looks up or creates the cached `InstanceContext`, and runs the rest of initialization inside that context. This means all downstream services — plugins, the session store, the permission table — operate in the scope of a single project directory.
 
-The most important invariant is that the linked entities are allowed to change implementation detail without changing the high-level guarantee described here. When a change breaks that guarantee, the failure usually appears at subsystem boundaries first: a summary no longer compacts correctly, a session route stops being stable, a skill path is not loaded consistently, or a permission rule is evaluated in the wrong layer.
+### Client connection model
 
-Operationally, this means debugging should follow the mechanism rather than a UI symptom. Start where the concept is introduced, then inspect the next boundary where data, policy, or control is handed off. The source evidence table below is organized to support exactly that style of investigation.
+Clients communicate with the server through two channels:
 
-## Involved Entities
+1. **REST endpoints** — HTTP POST/GET calls for actions such as creating a session, submitting a message, or fetching provider configuration. These follow request/response semantics.
+2. **SSE stream** — A persistent `GET /bus` endpoint delivers a real-time event stream to every connected client. Any state change on the server (new message part, permission request, session status update) is serialized as a `Bus` event and pushed through this channel.
 
-| Entity | Role In This Concept |
-| --- | --- |
-| [Workspace Routing and Remote Control](../syntheses/workspace-routing-and-remote-control.md) | Local vs remote workspaces, adaptors, and forwarded requests |
-| [Multi Client Product Architecture](../syntheses/multi-client-product-architecture.md) | TUI, app, web, desktop, Slack, and SDK surfaces around one core |
-| [Server API](../entities/server-api.md) | Hono server, middleware, OpenAPI generation, and routed APIs |
-| [Control Plane and Workspaces](../entities/control-plane-and-workspaces.md) | Workspace model, adaptors, remote routing, and SSE syncing |
-| [Request To Session Execution Flow](../syntheses/request-to-session-execution-flow.md) | Related page in this wiki. |
-| [Architecture Overview](../summaries/architecture-overview.md) | High-level orientation to the OpenCode monorepo, package boundaries, and runtime model |
+The `Bus` subsystem is the internal pub/sub backbone. When a session produces a new output token, the session code publishes a `Session.Event.PartDelta` event to the bus. The SSE handler subscribes to the bus and forwards every event to all connected clients. Clients render whatever arrives; they never hold authoritative state.
+
+### Event propagation
+
+`GlobalBus` is the process-level event emitter used for cross-instance signaling (for example `server.instance.disposed`). The per-request `Bus` operates within the Effect service layer and is scoped to a running instance. Plugin errors, permission requests, and session lifecycle events all flow through `Bus.publish()` and reach connected clients without the server needing to know which surfaces are active.
+
+### TUI attach flow
+
+`AttachCommand` checks whether a server is already listening on the project's socket. If one is found, it connects immediately. If not, it forks the server in the background, waits for readiness, and then connects. From the perspective of the server, a TUI session is indistinguishable from an SDK session: both are HTTP clients reading from the SSE stream and issuing REST requests.
+
+### State ownership
+
+The server owns:
+- All `Session` records (persisted to SQLite via `SessionTable`)
+- Provider configuration and credential resolution (`Auth`)
+- The active permission ruleset and persistent approvals (`PermissionTable`)
+- The project `InstanceContext` (directory, worktree, project metadata)
+
+Clients own only transient UI state: scroll position, focused pane, user input buffer. No session or agent data is stored client-side.
+
+## Invariants
+
+1. Exactly one `InstanceContext` exists per canonical project directory at any moment. Concurrent attach requests for the same path share the cached promise returned by `Instance.provide()`.
+2. Every state change visible to a client was published through `Bus`. There is no out-of-band mutation path that bypasses the event stream.
+3. The server can run headless (no TUI attached) indefinitely. Sessions created via the SDK or REST API persist and are visible the moment a TUI client attaches.
+4. `AttachCommand` always connects over the network, even when it starts the server itself. There is no "embedded" mode where the TUI runs the agent inline.
+5. Disposing an instance via `disposeInstance()` emits `server.instance.disposed` on `GlobalBus` before tearing down the context, giving clients a chance to detach cleanly.
 
 ## Source Evidence
 
-| File | Why It Matters |
+| File | What it confirms |
 | --- | --- |
-| `packages/opencode/src/index.ts` | Root command entry point and startup/migration flow |
-| `packages/opencode/src/cli/bootstrap.ts` | Project-scoped bootstrap helper |
-| `packages/opencode/src/server/server.ts` | Main Hono server construction and OpenAPI generation |
-| `packages/opencode/src/server/router.ts` | Workspace-aware local/remote routing |
-| `packages/opencode/src/control-plane/workspace.ts` | Workspace records, adaptors, and sync loop |
-| `packages/opencode/src/control-plane/schema.ts` | Workspace identifiers and schemas |
+| `packages/opencode/src/project/instance.ts` | `Instance.provide()` cache keyed by `Filesystem.resolve()`, `boot()` calling `Project.fromDirectory()`, `GlobalBus.emit("server.instance.disposed")` |
+| `packages/opencode/src/session/index.ts` | `Bus` publish calls for session events; `SessionTable` as the persistence layer |
+| `packages/opencode/src/permission/index.ts` | `Permission.Event.Asked` published on the bus; `PermissionTable` for persisted approvals |
+| `packages/opencode/src/plugin/index.ts` | `publishPluginError()` routes errors through the bus; plugin lifecycle wired to instance startup |
+| `packages/opencode/src/provider/provider.ts` | Provider construction scoped per instance; `Auth` and `Config` resolved at server startup |
 
 ## See Also
 
-- [Workspace Routing and Remote Control](../syntheses/workspace-routing-and-remote-control.md)
-- [Multi Client Product Architecture](../syntheses/multi-client-product-architecture.md)
+- [Project Scoped Instance Lifecycle](project-scoped-instance-lifecycle.md)
+- [Provider Agnostic Model Routing](provider-agnostic-model-routing.md)
+- [Permission and Approval Gating](permission-and-approval-gating.md)
+- [Plugin Driven Extensibility](plugin-driven-extensibility.md)
 - [Server API](../entities/server-api.md)
-- [Control Plane and Workspaces](../entities/control-plane-and-workspaces.md)
-- [Request To Session Execution Flow](../syntheses/request-to-session-execution-flow.md)
+- [Multi Client Product Architecture](../syntheses/multi-client-product-architecture.md)
+- [Workspace Routing and Remote Control](../syntheses/workspace-routing-and-remote-control.md)
+- [Request to Session Execution Flow](../syntheses/request-to-session-execution-flow.md)
 - [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

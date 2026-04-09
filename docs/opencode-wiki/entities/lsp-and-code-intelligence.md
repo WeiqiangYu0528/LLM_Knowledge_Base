@@ -2,62 +2,146 @@
 
 ## Overview
 
-OpenCode has explicit language-server support rather than treating code intelligence as incidental. This powers LSP-aware tooling and helps distinguish OpenCode from simpler prompt-only terminal agents.
+OpenCode integrates the Language Server Protocol (LSP) to provide code intelligence capabilities that go beyond text manipulation. Rather than relying solely on the AI model's knowledge of code structure, the LSP subsystem launches and manages language server processes for the workspace, collects real-time diagnostics, and exposes go-to-definition, hover, document symbols, and workspace symbol queries as structured data. These capabilities enrich the context available to the AI agent when it is reading, navigating, or modifying source files.
 
-LSP features are integrated as runtime services and tools, not as a separate IDE-only subsystem.
+The LSP subsystem lives in `src/lsp/` and is organized under the `LSP` namespace. It is built on `vscode-jsonrpc` for protocol framing and integrates with the application `Bus` for event propagation.
 
-In practice, this page should be read as a boundary explanation, not just a file list. LSP and Code Intelligence owns a specific slice of the OpenCode runtime, but it only makes sense in relation to neighboring systems such as [Tool System](tool-system.md), [Project and Instance System](project-and-instance-system.md), [Tool and Agent Composition](../concepts/tool-and-agent-composition.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
+### `LSP.Range`
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `packages/opencode/src/lsp/index.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `packages/opencode/src/lsp/server.ts`, `packages/opencode/src/lsp/client.ts`, `packages/opencode/src/lsp/launch.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | LSP entry point; LSP server interactions; LSP client logic; Launch/setup flow |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | LSP server interactions |
+A Zod schema for a text range in a document:
+
+```
+{ start: { line, character }, end: { line, character } }
+```
+
+Ranges are used throughout LSP responses (diagnostics, symbol locations, definition results) and are exposed through the server HTTP API under the `Range` ref.
+
+### `LSP.Symbol`
+
+Workspace-level symbol type with `name`, `kind` (integer LSP symbol kind), and a `location` carrying a `uri` and `Range`. Used for workspace-wide symbol search results.
+
+### `LSP.DocumentSymbol`
+
+File-level symbol type adding `detail` and `selectionRange` in addition to the fields from `LSP.Symbol`. Used for outline/structure queries on a specific open file.
+
+### `LSP.Status`
+
+A Zod schema tracking the health of a managed language server:
+
+```
+{ id, name, root, status: "connected" | "error" }
+```
+
+Status objects are published via `LSP.Event.Updated` so clients can display which language servers are active and whether they are healthy.
+
+### `LSP.Event.Updated`
+
+A `BusEvent` with an empty payload published whenever the set of managed language servers changes — on connection, disconnection, or status transition. Consumers such as the TUI subscribe to this event to refresh the LSP status display.
+
+### `LSPClient.Diagnostic`
+
+Re-exported from `vscode-languageserver-types`, this is the standard LSP diagnostic type. Diagnostics are stored per file path in a `Map<string, Diagnostic[]>` inside each `LSPClient` instance.
+
+### `LSPClient.InitializeError`
+
+A `NamedError` carrying `{ serverID }` thrown when an LSP server fails to complete its initialization handshake.
+
+### `LSPClient.Event.Diagnostics`
+
+A `BusEvent` with schema `{ serverID, path }` published after the `textDocument/publishDiagnostics` notification is received and stored. Subscribers can query the specific diagnostic list for the affected file path.
 
 ## Architecture
 
-LSP and Code Intelligence is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `packages/opencode/src/lsp/index.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Module Structure
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+The `src/lsp/` directory contains five files with distinct responsibilities:
 
-For implementers, the important question is not only what LSP and Code Intelligence does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+| File | Responsibility |
+|---|---|
+| `index.ts` | `LSP` namespace, `LSP.Service`, instance state, server management layer |
+| `client.ts` | `LSPClient` — jsonrpc connection wrapper, diagnostic storage, LSP request methods |
+| `server.ts` | `LSPServer` — configuration schema for language server entries |
+| `launch.ts` | `spawn()` — subprocess creation with piped stdio |
+| `language.ts` | `LANGUAGE_EXTENSIONS` — map from file extension to language ID |
+
+### `LSPServer` Configuration
+
+Each entry in the LSP configuration (from `Config`) describes a language server to manage. `LSPServer.Handle` is the runtime representation of a running server process, including the child process reference and any server-specific `initialization` options to return for `workspace/configuration` requests.
+
+### `LSPClient.create()`
+
+`LSPClient.create({ serverID, server, root })` establishes the JSON-RPC connection over the server process's stdio streams using `createMessageConnection` from `vscode-jsonrpc/node`. A `StreamMessageReader` wraps `process.stdout` and a `StreamMessageWriter` wraps `process.stdin`.
+
+The client immediately registers handlers for key protocol notifications and requests:
+
+- `textDocument/publishDiagnostics` — stores diagnostics in the `Map` and publishes `LSPClient.Event.Diagnostics` (debounced by `DIAGNOSTICS_DEBOUNCE_MS = 150` ms). For the TypeScript server, initial diagnostics on files that have never been seen before are suppressed to reduce noise.
+- `window/workDoneProgress/create` — acknowledged with `null` (progress notifications are not used by OpenCode).
+- `workspace/configuration` — returns the server's `initialization` options so the language server can receive its startup configuration without an explicit `initialize` options field.
+- `client/registerCapability` and `client/unregisterCapability` — no-op handlers to satisfy servers that send capability registration requests.
+- `workspace/workspaceFolders` — returns a single folder entry pointing to `root` as a file URI.
+
+### Language Server Spawn Flow
+
+`launch.ts` exports a `spawn(cmd, args?, opts?)` function that wraps `Process.spawn()` with explicit `stdin: "pipe"`, `stdout: "pipe"`, `stderr: "pipe"` options. This produces a `Child` process with all three streams available as non-null handles, which is required for the jsonrpc message framing.
+
+The main `LSP` namespace (in `index.ts`) imports `spawn` as `lspspawn` and uses it to start language server processes defined in the project configuration. The `Flag.OPENCODE_PURE` flag suppresses LSP initialization in pure mode.
+
+### Language Extension Map
+
+`LANGUAGE_EXTENSIONS` in `language.ts` maps file extensions (e.g., `.ts`, `.py`, `.go`) to their LSP language identifier strings. This map is used when opening documents (`textDocument/didOpen`) to populate the `languageId` field required by the protocol.
+
+### `SymbolKind` Enum
+
+The `index.ts` file defines a `SymbolKind` enum matching the LSP specification integer values. This is used when constructing `LSP.Symbol` and `LSP.DocumentSymbol` results for API responses, enabling clients to display appropriate icons for each symbol type.
 
 ## Runtime Behavior
 
-1. `lsp/index.ts` becomes relevant when lSP entry point.
-2. `lsp/server.ts` becomes relevant when lSP server interactions.
-3. `lsp/client.ts` becomes relevant when lSP client logic.
-4. `lsp/launch.ts` becomes relevant when launch/setup flow.
-5. `tool/lsp.ts` becomes relevant when lSP-backed tool implementation.
+### Server Initialization Sequence
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+1. `LSP.layer` initializes via `InstanceState.make()`, scoping language server connections to the current workspace instance.
+2. For each entry in the `Config` LSP configuration, a subprocess is spawned via `lspspawn`.
+3. `LSPClient.create()` is called to wrap the subprocess in a jsonrpc connection.
+4. The `initialize` request is sent to the language server with the workspace root URI and client capabilities.
+5. `initialized` notification is sent after the server responds.
+6. `LSP.Event.Updated` is published with the new status.
 
-## Variants, Boundaries, and Failure Modes
+### Diagnostic Flow
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+1. Language server sends `textDocument/publishDiagnostics` after analyzing a file.
+2. `LSPClient` normalizes the URI to a filesystem path using `Filesystem.normalizePath(fileURLToPath(uri))`.
+3. The diagnostic list is stored in the `Map<string, Diagnostic[]>` keyed by the normalized path.
+4. `LSPClient.Event.Diagnostics` is published with `{ serverID, path }`.
+5. Consumers (the agent tool layer) can query the stored diagnostic list on demand.
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### LSP-Backed Tool Operations
+
+The LSP service provides methods that the tool layer calls to enrich AI operations:
+
+- `textDocument/definition` — resolves a symbol at a given position to its definition location
+- `textDocument/hover` — retrieves type and documentation information for a symbol
+- `textDocument/documentSymbol` — returns the symbol outline of a file
+- `workspace/symbol` — searches for symbols matching a query across the workspace
+- `textDocument/references` — finds all references to a symbol
+
+These methods use `withTimeout` to avoid blocking the agent loop if a language server is slow to respond.
+
+### Connection Lifecycle
+
+Language server processes are managed as children of the OpenCode process. If a language server exits unexpectedly, the error is captured and the server's status transitions to `"error"`. The `LSP.Event.Updated` event is published so the TUI can display the failure. Reconnection is not automatic; users must restart the session or trigger re-initialization.
 
 ## Source Files
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/lsp/index.ts` | LSP entry point |
-| `packages/opencode/src/lsp/server.ts` | LSP server interactions |
-| `packages/opencode/src/lsp/client.ts` | LSP client logic |
-| `packages/opencode/src/lsp/launch.ts` | Launch/setup flow |
-| `packages/opencode/src/tool/lsp.ts` | LSP-backed tool implementation |
+- `/Users/weiqiangyu/Downloads/wiki/opencode/packages/opencode/src/lsp/index.ts` — `LSP` namespace, service layer, event definitions, `Symbol`, `DocumentSymbol`, `Status`, `Range` types
+- `/Users/weiqiangyu/Downloads/wiki/opencode/packages/opencode/src/lsp/client.ts` — `LSPClient.create()`, diagnostic storage, jsonrpc connection, `InitializeError`, `Event.Diagnostics`
+- `/Users/weiqiangyu/Downloads/wiki/opencode/packages/opencode/src/lsp/server.ts` — `LSPServer` configuration schema and `Handle` type
+- `/Users/weiqiangyu/Downloads/wiki/opencode/packages/opencode/src/lsp/launch.ts` — `spawn()` subprocess helper
+- `/Users/weiqiangyu/Downloads/wiki/opencode/packages/opencode/src/lsp/language.ts` — `LANGUAGE_EXTENSIONS` mapping
 
 ## See Also
 
-- [Tool System](tool-system.md)
-- [Project and Instance System](project-and-instance-system.md)
-- [Tool and Agent Composition](../concepts/tool-and-agent-composition.md)
-- [Request to Session Execution Flow](../syntheses/request-to-session-execution-flow.md)
-- [Client Server Agent Architecture](../concepts/client-server-agent-architecture.md)
-- [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)
+- [Tool System](./tool-system.md) — LSP-backed tools (definition, hover, symbols) are registered in the tool registry
+- [Session System](./session-system.md) — diagnostic events can be attached to session context
+- [Project and Instance System](./project-and-instance-system.md) — `InstanceState` scopes LSP connections to workspace instances
+- [Server API](./server-api.md) — LSP status and diagnostic endpoints are exposed via HTTP

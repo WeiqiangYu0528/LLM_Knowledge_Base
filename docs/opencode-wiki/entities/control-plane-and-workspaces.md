@@ -2,55 +2,197 @@
 
 ## Overview
 
-The control plane and workspace subsystem lets OpenCode route requests either to local project instances or to remote workspaces behind adaptors. This is a major architectural differentiator relative to simpler single-process coding agents.
+The control plane and workspace subsystem lets OpenCode route HTTP requests either to local project instances running in the same process or to remote workspaces running in separate processes (such as git worktrees). This is the architectural layer that makes OpenCode multi-workspace aware: a single server can simultaneously host several independent project contexts and proxy traffic between them transparently.
 
-Workspaces let OpenCode talk about local and remote projects with one routing vocabulary.
+The key concepts are:
 
-In practice, this page should be read as a boundary explanation, not just a file list. Control Plane and Workspaces owns a specific slice of the OpenCode runtime, but it only makes sense in relation to neighboring systems such as [Server API](server-api.md), [Project and Instance System](project-and-instance-system.md), [Client Server Agent Architecture](../concepts/client-server-agent-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+- A **Workspace** is a database record that describes where a project context lives (`type`, `directory`, `branch`, `extra`).
+- An **Adaptor** is the interface that the control plane uses to create, configure, and proxy requests to a workspace of a given type.
+- The **`WorkspaceRouterMiddleware`** in `server/router.ts` is the HTTP-level gating layer that inspects every incoming request, looks up the target workspace, and routes accordingly.
+- **SSE (`sse.ts`)** provides the event stream parsing logic used when a remote workspace pushes events back to the control plane.
 
-## Key Types / Key Concepts
+---
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `packages/opencode/src/control-plane/workspace.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `packages/opencode/src/control-plane/schema.ts`, `packages/opencode/src/control-plane/adaptors/`, `packages/opencode/src/server/router.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Workspace records, adaptors, and sync loop; Workspace identifiers and schemas; Workspace adaptor implementations; Request routing between local and remote workspaces |
-| Extension or policy points | The main extension or gating surfaces live around `packages/opencode/src/server/router.ts`. |
-| Persistent effects | Workspace records, adaptors, and sync loop; Request routing between local and remote workspaces |
+## Key Types
+
+### `WorkspaceInfo` / `Workspace.Info`
+
+```ts
+// src/control-plane/types.ts
+export const WorkspaceInfo = z.object({
+  id:        WorkspaceID.zod,
+  type:      z.string(),          // e.g. "worktree" — determines which adaptor handles it
+  branch:    z.string().nullable(),
+  name:      z.string().nullable(),
+  directory: z.string().nullable(), // resolved filesystem path for local workspaces
+  extra:     z.unknown().nullable(), // adaptor-specific configuration blob
+  projectID: ProjectID.zod,
+})
+```
+
+`directory` is `null` for remote workspace types that do not have a local path. `extra` is a free-form JSON field that adaptors can use to store their own configuration.
+
+---
+
+### `WorkspaceID`
+
+```ts
+// src/control-plane/schema.ts
+const workspaceIdSchema = Schema.String.pipe(Schema.brand("WorkspaceID"))
+
+export const WorkspaceID = workspaceIdSchema.pipe(
+  withStatics((schema) => ({
+    make:      (id: string) => schema.makeUnsafe(id),
+    ascending: (id?: string) => schema.makeUnsafe(Identifier.ascending("workspace", id)),
+    zod:       Identifier.schema("workspace").pipe(z.custom<WorkspaceID>()),
+  })),
+)
+```
+
+A branded string type guaranteed to have the `workspace_` prefix via the `Identifier.ascending()` generator. Used as primary key in `WorkspaceTable` and as the `?workspace=` query parameter on routed HTTP requests.
+
+---
+
+### `Adaptor`
+
+```ts
+// src/control-plane/types.ts
+export type Adaptor = {
+  configure(input: WorkspaceInfo): WorkspaceInfo | Promise<WorkspaceInfo>
+  create(input: WorkspaceInfo, from?: WorkspaceInfo): Promise<void>
+  remove(config: WorkspaceInfo): Promise<void>
+  fetch(config: WorkspaceInfo, input: RequestInfo | URL, init?: RequestInit): Promise<Response>
+}
+```
+
+The adaptor pattern decouples the control plane from workspace implementation details. The `fetch` method is the core: it proxies an HTTP request to wherever the workspace actually runs. The only built-in adaptor today is `WorktreeAdaptor` (registered under the `"worktree"` type), which boots a child process server in the worktree directory and forwards requests to it via HTTP.
+
+---
+
+### `Workspace.Event`
+
+```ts
+export const Event = {
+  Ready:  BusEvent.define("workspace.ready",  z.object({ name: z.string() })),
+  Failed: BusEvent.define("workspace.failed", z.object({ message: z.string() })),
+}
+```
+
+Published on the `GlobalBus` when an adaptor finishes provisioning (`Ready`) or encounters a fatal error (`Failed`).
+
+---
+
+### Router rule type
+
+```ts
+// src/server/router.ts
+type Rule = {
+  method?:  string
+  path:     string
+  exact?:   boolean
+  action:  "local" | "forward"
+}
+```
+
+Rules control whether a request to a known workspace should be served from the local cached state (`"local"`) or forwarded to the remote adaptor (`"forward"`). The `local()` function evaluates the rule list using method + path prefix matching. Currently, `GET /session` is served locally from cache while `POST /session/status` is forwarded.
+
+---
 
 ## Architecture
 
-Control Plane and Workspaces is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `packages/opencode/src/control-plane/workspace.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+```
+src/control-plane/
+  workspace.ts       ← Workspace namespace: create, get, list, fromRow, Event
+  schema.ts          ← WorkspaceID branded type
+  types.ts           ← WorkspaceInfo schema, Adaptor interface
+  workspace.sql.ts   ← WorkspaceTable Drizzle schema
+  sse.ts             ← parseSSE() — stream reader for remote workspace event relay
+  adaptors/
+    index.ts         ← getAdaptor(type), installAdaptor(type, adaptor) registry
+    worktree.ts      ← WorktreeAdaptor — local git worktree workspace implementation
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+src/server/
+  router.ts          ← WorkspaceRouterMiddleware — HTTP routing logic
+```
 
-For implementers, the important question is not only what Control Plane and Workspaces does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+`workspace.ts` owns the database layer (CRUD on `WorkspaceTable`) and the lifecycle events. `router.ts` sits at the HTTP boundary and is the only code that reads the `?workspace=` query parameter or the `x-opencode-directory` header. The adaptor registry in `adaptors/index.ts` is lazy-loaded to avoid pulling adaptor dependencies until a workspace of that type is actually used.
+
+---
 
 ## Runtime Behavior
 
-1. `control-plane/workspace.ts` becomes relevant when workspace records, adaptors, and sync loop.
-2. `control-plane/schema.ts` becomes relevant when workspace identifiers and schemas.
-3. `adaptors/` becomes relevant when workspace adaptor implementations.
-4. `server/router.ts` becomes relevant when request routing between local and remote workspaces.
-5. `control-plane/sse.ts` becomes relevant when sSE parsing and workspace event flow.
+### Request routing — `WorkspaceRouterMiddleware`
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+1. **Every request** below the workspace-aware mount point passes through `WorkspaceRouterMiddleware`.
 
-## Variants, Boundaries, and Failure Modes
+2. **Directory resolution.** The middleware reads the target directory from `?directory=` query param, the `x-opencode-directory` header, or falls back to `process.cwd()`. The value is URI-decoded and resolved to an absolute canonical path.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+3. **Workspace parameter check.** If no `?workspace=` query parameter is present, the request is for the **project workspace** — the middleware calls `Instance.provide({ directory, init: InstanceBootstrap, fn })` and delegates to `InstanceRoutes`. This is the common case for the TUI and CLI clients.
 
-The main extension and failure surfaces are concentrated around `packages/opencode/src/server/router.ts`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+4. **Workspace lookup.** If `?workspace=` is present, `Workspace.get(workspaceID)` queries `WorkspaceTable`. If no row is found, a 500 response is returned immediately.
+
+5. **Local worktree workspace.** If `workspace.type === "worktree"` and `workspace.directory` is set, the middleware calls `Instance.provide({ directory: workspace.directory, ... })` and serves the request locally, preserving the Bun websocket environment needed for PTY upgrades.
+
+6. **Remote workspace — local rules.** If the workspace type is not `"worktree"`, the `local()` function is consulted. Paths configured as `"local"` (e.g. `GET /session`) are served directly from the current process without an instance context, because the data is cached locally.
+
+7. **Remote workspace — proxy.** For all other paths, `getAdaptor(workspace.type)` loads the adaptor, then `adaptor.fetch(workspace, pathname+search, init)` proxies the request to the remote process. Request body is passed as `ArrayBuffer` and the `x-opencode-workspace` header is stripped before forwarding.
+
+---
+
+### Workspace creation — `Workspace.create()`
+
+1. Generates an ascending `WorkspaceID`.
+2. Calls `adaptor.configure(input)` to let the adaptor fill in defaults (name, directory, extra).
+3. Inserts the row into `WorkspaceTable`.
+4. Calls `adaptor.create(config)` to provision the workspace (e.g. create the git worktree, run `commands.start`).
+5. Returns the completed `Workspace.Info`.
+
+---
+
+### SSE parsing — `parseSSE()`
+
+```ts
+export async function parseSSE(
+  body:    ReadableStream<Uint8Array>,
+  signal:  AbortSignal,
+  onEvent: (event: unknown) => void,
+): Promise<void>
+```
+
+Used by the `WorktreeAdaptor` when it needs to relay events from a child-process server back to the parent. The function reads chunks from the stream, accumulates a line buffer, splits on `\n\n` SSE boundaries, and calls `onEvent` with the parsed JSON payload. Non-JSON payloads are wrapped in a synthetic `{ type: "sse.message" }` envelope. The `retry:` field from the SSE stream is respected and the `id:` field is tracked for reconnect scenarios.
+
+---
+
+### Adaptor registry — `getAdaptor()` / `installAdaptor()`
+
+```ts
+// src/control-plane/adaptors/index.ts
+const ADAPTORS: Record<string, () => Promise<Adaptor>> = {
+  worktree: lazy(async () => (await import("./worktree")).WorktreeAdaptor),
+}
+
+export function getAdaptor(type: string): Promise<Adaptor>
+export function installAdaptor(type: string, adaptor: Adaptor)
+```
+
+Adaptors are registered by string type name. `lazy()` ensures each adaptor module is imported at most once. `installAdaptor` is experimental and intended for testing; it bypasses the TypeScript type constraints.
+
+---
 
 ## Source Files
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/control-plane/workspace.ts` | Workspace records, adaptors, and sync loop |
-| `packages/opencode/src/control-plane/schema.ts` | Workspace identifiers and schemas |
-| `packages/opencode/src/control-plane/adaptors/` | Workspace adaptor implementations |
-| `packages/opencode/src/server/router.ts` | Request routing between local and remote workspaces |
-| `packages/opencode/src/control-plane/sse.ts` | SSE parsing and workspace event flow |
+| File | Key functions / exports |
+|---|---|
+| `src/control-plane/workspace.ts` | `Workspace.create()`, `Workspace.get()`, `Workspace.list()`, `Workspace.Event.Ready/Failed`, `Workspace.Info` |
+| `src/control-plane/schema.ts` | `WorkspaceID` branded type, `WorkspaceID.ascending()`, `WorkspaceID.make()` |
+| `src/control-plane/types.ts` | `WorkspaceInfo` schema, `Adaptor` interface |
+| `src/control-plane/workspace.sql.ts` | `WorkspaceTable` Drizzle schema |
+| `src/control-plane/sse.ts` | `parseSSE(body, signal, onEvent)` — SSE stream reader |
+| `src/control-plane/adaptors/index.ts` | `getAdaptor(type)`, `installAdaptor(type, adaptor)` |
+| `src/control-plane/adaptors/worktree.ts` | `WorktreeAdaptor` — local git worktree adaptor implementation |
+| `src/server/router.ts` | `WorkspaceRouterMiddleware` — HTTP routing between local and remote workspaces |
+
+---
 
 ## See Also
 

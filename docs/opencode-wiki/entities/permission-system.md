@@ -2,53 +2,196 @@
 
 ## Overview
 
-The permission system governs whether a tool call is allowed, denied, or requires user approval. It stores approved patterns at the project level, emits permission events, and coordinates request/reply lifecycles with the rest of the runtime.
+The permission system is the gatekeeper for every tool call that an AI agent wants to execute. Before a tool runs, it must pass through the permission layer, which evaluates the requested operation against a priority-ordered ruleset, decides whether to allow, deny, or pause and ask the user, then persists any "always approve" answers so the user is not repeatedly interrupted for the same pattern.
 
-Permissions are not cosmetic prompts; they are part of the execution contract for tools and remote actions.
+Permissions are first-class runtime contracts, not cosmetic prompts. A `deny` decision raises a typed error that halts the tool call and surfaces a policy message back to the model. An `ask` decision blocks execution in an Effect `Deferred` until the user replies via the HTTP API, and a `reject` reply cascades to cancel every other pending request from the same session.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Permission System owns a specific slice of the OpenCode runtime, but it only makes sense in relation to neighboring systems such as [Tool System](tool-system.md), [Session System](session-system.md), [Permission and Approval Gating](../concepts/permission-and-approval-gating.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+The system lives in `src/permission/` and integrates tightly with the session bus, the project database, and the `InstanceState` scoping mechanism that ties per-project state to the current async context.
 
-## Key Types / Key Concepts
+---
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `packages/opencode/src/permission/index.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `packages/opencode/src/permission/evaluate.ts`, `packages/opencode/src/permission/schema.ts`, `packages/opencode/src/session/session.sql.ts` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Permission rules, request lifecycle, and service implementation; Rule evaluation logic; Permission ID schema; Persistence table used for approved rules |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | Persistence table used for approved rules |
+## Key Types
+
+### `Permission.Action`
+
+```ts
+// "allow" | "deny" | "ask"
+export const Action = z.enum(["allow", "deny", "ask"]).meta({ ref: "PermissionAction" })
+export type Action = z.infer<typeof Action>
+```
+
+- `"allow"` — the tool call proceeds immediately.
+- `"deny"` — the call is rejected and a `DeniedError` is raised with the matching rules attached.
+- `"ask"` — execution is suspended until the user replies.
+
+---
+
+### `Permission.Rule`
+
+```ts
+export const Rule = z.object({
+  permission: z.string(),   // glob pattern for the permission name, e.g. "bash" or "file.*"
+  pattern:    z.string(),   // glob pattern for the specific resource, e.g. "/tmp/**"
+  action:     Action,
+}).meta({ ref: "PermissionRule" })
+```
+
+Rules are matched via `Wildcard.match()` on both `permission` and `pattern`, so wildcards in both dimensions are supported.
+
+---
+
+### `Permission.Ruleset`
+
+```ts
+export const Ruleset = Rule.array().meta({ ref: "PermissionRuleset" })
+export type Ruleset = z.infer<typeof Ruleset>
+```
+
+An ordered array of `Rule`. Evaluation uses `findLast`, so later rules win over earlier ones. The config-level ruleset is provided by the caller; the session-level `approved` list is accumulated in memory during a session and also persisted to `PermissionTable`.
+
+---
+
+### `Permission.Request`
+
+```ts
+export const Request = z.object({
+  id:         PermissionID.zod,         // unique ascending ID for this pending request
+  sessionID:  SessionID.zod,            // which session is requesting
+  permission: z.string(),               // the permission name being requested (e.g. "bash")
+  patterns:   z.string().array(),       // resource patterns being accessed (e.g. ["/etc/hosts"])
+  metadata:   z.record(z.string(), z.any()), // arbitrary tool metadata for display
+  always:     z.string().array(),       // patterns the tool suggests could be "always allowed"
+  tool:       z.object({
+    messageID: MessageID.zod,
+    callID:    z.string(),
+  }).optional(),
+}).meta({ ref: "PermissionRequest" })
+```
+
+`always` is an advisory list from the tool; when the user replies `"always"`, these patterns are appended to the in-memory `approved` ruleset and written to the database.
+
+---
+
+### `Permission.Reply`
+
+```ts
+export const Reply = z.enum(["once", "always", "reject"])
+export type Reply = z.infer<typeof Reply>
+```
+
+- `"once"` — approve this single request, do not persist.
+- `"always"` — approve and persist; future requests matching the same patterns are auto-allowed.
+- `"reject"` — deny this request and cancel all other pending requests from the same session.
+
+---
+
+### `Permission.Approval`
+
+```ts
+export const Approval = z.object({
+  projectID: ProjectID.zod,
+  patterns:  z.string().array(),
+})
+```
+
+Used when writing project-level approvals to the database.
+
+---
+
+### `Permission.Event.Asked` and `Permission.Event.Replied`
+
+```ts
+export const Event = {
+  Asked: BusEvent.define("permission.asked", Request),
+  Replied: BusEvent.define(
+    "permission.replied",
+    z.object({
+      sessionID: SessionID.zod,
+      requestID: PermissionID.zod,
+      reply:     Reply,
+    }),
+  ),
+}
+```
+
+Both events are published on the instance `Bus`. Clients subscribe to `permission.asked` over SSE to show the user a prompt, and the API route calls `Permission.Service.reply()` to complete the deferred.
+
+---
+
+### Error Types
+
+| Class | Tagged error name | When raised |
+|---|---|---|
+| `DeniedError` | `PermissionDeniedError` | A `deny` rule matched; carries the relevant ruleset for model feedback |
+| `RejectedError` | `PermissionRejectedError` | User replied `"reject"` |
+| `CorrectedError` | `PermissionCorrectedError` | User rejected with a feedback message; carries `feedback: string` |
+
+---
+
+### `PermissionTable` (DB)
+
+Defined in `src/session/session.sql.ts`. Stores project-level approved rules as a JSON array, keyed by `project_id`. On instance boot the row is loaded into the in-memory `approved: Ruleset` state, and it is written back whenever the user replies `"always"`.
+
+---
 
 ## Architecture
 
-Permission System is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `packages/opencode/src/permission/index.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+```
+src/permission/
+  index.ts       ← public namespace; Service layer, ask/reply/list, bus integration
+  evaluate.ts    ← pure function: evalRule(permission, pattern, ...rulesets)
+  schema.ts      ← PermissionID branded type (ascending IDs)
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+src/session/
+  session.sql.ts ← PermissionTable: persists project-level approved rules
 
-For implementers, the important question is not only what Permission System does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+src/util/
+  wildcard.ts    ← Wildcard.match() for glob matching on permission and pattern fields
+```
+
+`index.ts` imports `evaluate` from `evaluate.ts` and `Wildcard` from `util/wildcard`. The `Permission.Service` Effect layer holds all mutable state in an `InstanceState`-scoped slot so that each project instance has its own independent pending map and approved list.
+
+The `AskInput` type extends `Request.partial({ id: true })` and adds a `ruleset` field so callers can pass the config-level rules alongside the request. The service merges `ruleset` and `approved` for evaluation but does not expose `approved` publicly.
+
+---
 
 ## Runtime Behavior
 
-1. `permission/index.ts` becomes relevant when permission rules, request lifecycle, and service implementation.
-2. `permission/evaluate.ts` becomes relevant when rule evaluation logic.
-3. `permission/schema.ts` becomes relevant when permission ID schema.
-4. `session/session.sql.ts` becomes relevant when persistence table used for approved rules.
+1. **Tool calls `Permission.Service.ask()`** with `AskInput` — includes the permission name, resource patterns, config ruleset, and optional `always` hints.
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+2. **Each pattern is evaluated independently.** `evalRule(permission, pattern, configRuleset, approvedRuleset)` is called. The function flattens both arrays and calls `rules.findLast(r => Wildcard.match(permission, r.permission) && Wildcard.match(pattern, r.pattern))`. If no rule matches, the default is `{ action: "ask" }`.
 
-## Variants, Boundaries, and Failure Modes
+3. **If any pattern yields `"deny"`**, `ask()` immediately raises `DeniedError` with the matching config rules attached. Execution stops.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+4. **If all patterns yield `"allow"`**, `ask()` returns without suspending. The tool proceeds.
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+5. **If any pattern yields `"ask"`**, a `Deferred<void, RejectedError | CorrectedError>` is created. The `Request` is added to the `pending` map, and `Event.Asked` is published on the bus. The Effect fiber awaits the deferred.
+
+6. **The client receives `permission.asked` over SSE** and presents the request to the user. The user chooses `"once"`, `"always"`, or `"reject"` and POSTs to `/permission/reply`.
+
+7. **`Permission.Service.reply()` is called.** It looks up the pending entry, publishes `Event.Replied`, then branches:
+   - `"reject"` — fails the deferred with `RejectedError` (or `CorrectedError` if a message was supplied); also cancels every other pending request from the same `sessionID`.
+   - `"once"` — succeeds the deferred; no persistence.
+   - `"always"` — succeeds the deferred; pushes each `always` pattern into the in-memory `approved` list; re-evaluates any other pending requests from the same session that now pass, auto-resolving them.
+
+8. **Persistence.** When `"always"` is chosen, the updated `approved` ruleset is written back to `PermissionTable` for the current project. On next instance boot the row is reloaded, so approved patterns survive restarts.
+
+9. **Finalizer.** When the Effect scope is torn down (`Instance.dispose()`), an `addFinalizer` callback fails every remaining `pending` deferred with `RejectedError`, preventing leaked fibers.
+
+---
 
 ## Source Files
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/permission/index.ts` | Permission rules, request lifecycle, and service implementation |
-| `packages/opencode/src/permission/evaluate.ts` | Rule evaluation logic |
-| `packages/opencode/src/permission/schema.ts` | Permission ID schema |
-| `packages/opencode/src/session/session.sql.ts` | Persistence table used for approved rules |
+| File | Key functions / exports |
+|---|---|
+| `src/permission/index.ts` | `Permission.Action`, `Permission.Rule`, `Permission.Ruleset`, `Permission.Request`, `Permission.Reply`, `Permission.Approval`, `Permission.Event`, `Permission.Service`, `Permission.layer`, `Permission.evaluate()` |
+| `src/permission/evaluate.ts` | `evaluate(permission, pattern, ...rulesets): Rule` — pure rule evaluation using `findLast` |
+| `src/permission/schema.ts` | `PermissionID` — branded ascending identifier type |
+| `src/session/session.sql.ts` | `PermissionTable` — Drizzle table for project-level persisted approvals |
+| `src/util/wildcard.ts` | `Wildcard.match(subject, pattern)` — glob matching used by `evaluate` |
+| `src/server/routes/permission.ts` | HTTP routes: `POST /permission/reply`, `GET /permission/list` |
+
+---
 
 ## See Also
 
@@ -59,4 +202,3 @@ The main extension and failure surfaces are concentrated around the neighboring 
 - [Client Server Agent Architecture](../concepts/client-server-agent-architecture.md)
 - [Request To Session Execution Flow](../syntheses/request-to-session-execution-flow.md)
 - [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

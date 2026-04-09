@@ -1,81 +1,92 @@
 # Hermes Agent Architecture Overview
 
-> High-level orientation to Hermes Agent as a multi-surface agent platform rather than a single chat loop.
-
 ## Overview
 
-Hermes Agent is best understood as a shared runtime core wrapped by several product surfaces. The center of gravity is [`AIAgent`](../entities/agent-loop-runtime.md), implemented in `run_agent.py`, but the repository is not only a CLI assistant. The same runtime is reused by the interactive terminal app, the long-running messaging [gateway runtime](../entities/gateway-runtime.md), the [ACP adapter](../entities/acp-adapter.md) for editors, the [cron system](../entities/cron-system.md), and the research-oriented batch and environment stack described in [research and batch surfaces](../entities/research-and-batch-surfaces.md).
+Hermes Agent is easiest to understand as one shared agent runtime wrapped by several shells. It is not just a CLI agent with a few adapters bolted onto the side. The same core loop powers the terminal experience, the long-running [Gateway Runtime](../entities/gateway-runtime.md), the editor-facing [ACP Adapter](../entities/acp-adapter.md), the scheduled [Cron System](../entities/cron-system.md), and the [Research and Batch Surfaces](../entities/research-and-batch-surfaces.md).
 
-What makes Hermes distinctive is that the runtime core is surrounded by persistent context machinery. Prompt assembly is not just a string builder; it merges agent identity from `SOUL.md`, local memory snapshots, skill indexes, project context files, and per-platform overlays. Tool execution is not just JSON schema dispatch; it includes toolset selection, availability checks, approval-gated terminal execution, MCP discovery, and multiple execution backends. Session continuity is not just in-memory history; it spans SQLite persistence, FTS5 search, gateway session metadata, lineage across compression boundaries, and optional external memory providers.
+Hermes is also not a collection of separate agents that happen to share a repository. It is a platform that combines one reusable execution core with governed tool access, persistent session storage, and recall systems that survive across turns and sessions.
 
-The repo's own developer guide reflects this architecture. Files such as `website/docs/developer-guide/architecture.md`, `agent-loop.md`, `prompt-assembly.md`, `provider-runtime.md`, `tools-runtime.md`, `gateway-internals.md`, and `session-storage.md` are not side docs around the codebase; they mirror the major ownership boundaries that show up in the source tree itself.
+The central runtime anchor is [`AIAgent`](../entities/agent-loop-runtime.md) in `run_agent.py`. Around it sit the shells that accept input, the systems that build prompt context, the capability layer that exposes tools to the model, and the persistence layer that keeps long-running work coherent. If you keep those four layers separate in your head, the rest of the codebase gets much easier to read.
 
 ![Hermes Agent system architecture](../assets/graphs/hermes-agent-architecture.png)
 
 [Edit diagram source](../assets/graphs/hermes-agent-architecture.excalidraw)
 
-## Major Subsystems
+## Why The Repository Feels Larger Than A CLI Agent
 
-| Subsystem | Runtime role | Primary source anchors | Wiki page |
-|------|------|------|------|
-| Agent loop | Turn orchestration, retries, tool loops, callbacks, compression, fallback | `run_agent.py`, `website/docs/developer-guide/agent-loop.md` | [Agent Loop Runtime](../entities/agent-loop-runtime.md) |
-| Prompt system | Stable system prompt construction and ephemeral overlays | `agent/prompt_builder.py`, `agent/prompt_caching.py`, `website/docs/developer-guide/prompt-assembly.md` | [Prompt Assembly System](../entities/prompt-assembly-system.md) |
-| Provider runtime | Provider/model/auth resolution for primary and auxiliary calls | `hermes_cli/runtime_provider.py`, `hermes_cli/auth.py`, `agent/auxiliary_client.py` | [Provider Runtime](../entities/provider-runtime.md) |
-| Tool runtime | Registration, toolset filtering, dispatch, environment bridging | `tools/registry.py`, `model_tools.py`, `tools/approval.py` | [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) |
-| Memory and recall | Built-in memory, external providers, session search, recall injection | `agent/memory_manager.py`, `agent/memory_provider.py`, `plugins/memory/*` | [Memory and Learning Loop](../entities/memory-and-learning-loop.md) |
-| Session persistence | Long-lived storage for messages, titles, lineage, and search | `hermes_state.py`, `gateway/session.py` | [Session Storage](../entities/session-storage.md) |
-| Product shells | CLI, gateway, ACP, cron, and research runners | `hermes_cli/main.py`, `gateway/run.py`, `acp_adapter/server.py`, `cron/scheduler.py`, `batch_runner.py` | [CLI Runtime](../entities/cli-runtime.md), [Gateway Runtime](../entities/gateway-runtime.md), [ACP Adapter](../entities/acp-adapter.md) |
+A simple CLI agent can stop at "read input, call model, print output." Hermes does not. It supports multiple user-facing shells, and those shells all need consistent model behavior, tool behavior, and session continuity.
 
-The repository layout reflects these boundaries. Top-level Python files such as `run_agent.py`, `model_tools.py`, and `hermes_state.py` act as cross-cutting runtime nodes, while package directories such as `agent/`, `tools/`, `hermes_cli/`, `gateway/`, `cron/`, `acp_adapter/`, and `plugins/memory/` each own a specific layer of the product.
+That leads to more infrastructure around the core loop. The [CLI Runtime](../entities/cli-runtime.md) focuses on local interactive use. The [Gateway Runtime](../entities/gateway-runtime.md) adds inbound event handling, authorization, delivery, and session routing for messaging platforms. The [ACP Adapter](../entities/acp-adapter.md) exposes Hermes as an editor-facing service. The [Cron System](../entities/cron-system.md) creates scheduled agent runs instead of interactive ones.
 
-## Execution Model
+The repository is also larger because Hermes treats persistence as part of normal runtime behavior. Session history lives in [Session Storage](../entities/session-storage.md). Long-term recall and provider-backed memory live in [Memory and Learning Loop](../entities/memory-and-learning-loop.md). Prompt context is assembled from filesystem and runtime sources in [Prompt Assembly System](../entities/prompt-assembly-system.md), not from a single hardcoded template.
 
-Most Hermes flows converge on the same runtime sequence:
+Finally, tool exposure is governed instead of automatic. The model only sees the tools that pass platform presets, toolset filtering, and readiness checks, which is why [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) is a major subsystem rather than a thin helper.
 
-1. An entry surface receives user intent. In the CLI that happens through `hermes_cli/main.py` and the interactive chat shell. In the gateway it happens through a platform adapter that normalizes an inbound event. In ACP it happens through a JSON-RPC prompt call on an editor-managed session.
-2. The surface resolves configuration, model/provider settings, enabled toolsets, and the active `HERMES_HOME` profile. This is the job of the [config and profile system](../entities/config-and-profile-system.md), [CLI runtime](../entities/cli-runtime.md), and [provider runtime](../entities/provider-runtime.md).
-3. Hermes constructs or restores a conversation context. That may mean loading a session from SQLite, building gateway session metadata, or creating a fresh cron session with no prior history.
-4. `AIAgent.run_conversation()` assembles the effective system prompt, determines API mode, injects memory and context overlays, issues a model call, and either returns a final response or enters a tool loop.
-5. Tool calls flow through the [tool registry and dispatch](../entities/tool-registry-and-dispatch.md), which may route to local tools, remote execution environments, skill/document helpers, memory providers, or approval-gated terminal commands.
-6. After each turn, Hermes persists messages, updates or queues memory-provider sync, optionally compresses context, and returns the response through the originating shell.
+## The Main Runtime Layers
 
-This shared model is why Hermes can support dramatically different user surfaces without duplicating the agent logic. The surfaces differ mostly in session acquisition, callback presentation, approval transport, and delivery behavior. The loop itself stays centered on `run_agent.py`.
+The cleanest mental model is to separate Hermes into a few stable ownership layers. Each layer prepares work for the next one.
 
-## Architectural Themes
+| Layer | What it owns | Main anchors | Read next |
+|---|---|---|---|
+| Shells and entry surfaces | Accepting input, resolving config, choosing session identity, presenting results | `hermes_cli/main.py`, `gateway/run.py`, `acp_adapter/`, `cron/` | [CLI Runtime](../entities/cli-runtime.md), [Gateway Runtime](../entities/gateway-runtime.md), [ACP Adapter](../entities/acp-adapter.md), [Cron System](../entities/cron-system.md) |
+| Core agent runtime | Running the conversation loop, choosing API mode, handling retries, tool loops, fallback, callbacks, and compression | `run_agent.py`, `website/docs/developer-guide/agent-loop.md` | [Agent Loop Runtime](../entities/agent-loop-runtime.md) |
+| Capability surface | Registering tools, deciding which ones are visible, and dispatching model tool calls | `model_tools.py`, `tools/registry.py`, `toolsets.py` | [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) |
+| Prompt context and recall | Building the stable system prompt, layering in filesystem context, skills, memories, and external recall | `agent/prompt_builder.py`, `agent/memory_manager.py`, `agent/context_compressor.py` | [Prompt Assembly System](../entities/prompt-assembly-system.md), [Memory and Learning Loop](../entities/memory-and-learning-loop.md) |
+| Persistence and continuity | Saving sessions, supporting search and lineage, and restoring conversations across shells | `hermes_state.py`, `gateway/session.py` | [Session Storage](../entities/session-storage.md) |
 
-### One runtime, many shells
+This separation matters because Hermes does not want each shell to reimplement agent logic. A shell should prepare a request and deliver the outcome. The agent loop should own execution. The persistence and recall systems should preserve continuity without turning the shells themselves into runtime forks.
 
-Hermes deliberately resists splitting the system into separate per-surface agents. The CLI, gateway, ACP adapter, cron scheduler, and research stack all reuse the same agent loop and the same provider and tool runtime. That keeps tool behavior, model routing, and session semantics aligned even when the user moves between a terminal, a messaging thread, and an editor.
+## How A Request Moves Through Hermes
 
-### Filesystem-first identity and context
+Most Hermes requests follow the same broad path, even when the input surface changes.
 
-The repo uses the filesystem as an explicit configuration and identity surface. `HERMES_HOME` contains `SOUL.md`, `config.yaml`, `.env`, memory files, cron state, logs, and installed skills. Project context is discovered from files such as `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, or Cursor rules. This makes Hermes configurable without hardcoding every policy into Python classes, but it also means the prompt system has to enforce strict ordering and sanitization rules.
+1. A shell receives input. In the terminal that is the [CLI Runtime](../entities/cli-runtime.md). In chat platforms it is the [Gateway Runtime](../entities/gateway-runtime.md). In editors it is the [ACP Adapter](../entities/acp-adapter.md).
+2. The shell resolves runtime setup. That includes provider and model settings, active profile, enabled toolsets, and any surface-specific callbacks or approval paths.
+3. The shell determines session context. It may restore a stored conversation, create a fresh session, or map an inbound platform event onto a gateway session key before calling the agent.
+4. `AIAgent.run_conversation()` takes over. This is the main execution spine described in [Agent Loop Runtime](../entities/agent-loop-runtime.md): it assembles prompt context, formats messages for the selected API mode, and makes the model call.
+5. If the model asks for tools, Hermes routes those calls through the governed capability layer in [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md). Some agent-owned tools are intercepted inside the loop; normal tool calls go through the registry and its readiness checks.
+6. During and after the turn, Hermes updates continuity systems. Memory writes, recall hooks, compression, and session persistence flow through [Memory and Learning Loop](../entities/memory-and-learning-loop.md) and [Session Storage](../entities/session-storage.md).
+7. Control returns to the shell. The shell formats the final response, delivers it to the terminal, editor, or platform adapter, and handles any shell-specific follow-up such as queueing, approval responses, or background delivery.
 
-### Capability governance via toolsets and readiness
+The important pattern is that the shell-specific work happens mostly before and after the loop. The middle of the request is meant to stay shared.
 
-Hermes does not expose every tool to every session. Tool availability depends on selected toolsets, per-platform presets, runtime readiness checks, secrets, and dynamic discovery of MCP or plugin-provided tools. The system can therefore expose a narrow editor-safe `hermes-acp` surface, a broader CLI surface, or a gateway-specific set without changing the model loop itself.
+## Why Hermes Is Structured This Way
 
-### Persistence as a runtime primitive
+After the request flow, the next useful question is why the repository is partitioned this way. The short answer is that Hermes is optimized for runtime consistency across surfaces, not for keeping each surface self-contained.
 
-Persistence is part of normal operation, not an afterthought. SQLite session storage, memory files, session search, compression summaries, and external memory-provider plugins all exist so that long-running or cross-session workflows remain practical. This is the basis for Hermes' "self-improving agent" framing rather than a stateless assistant loop.
+### The shells stay thin so behavior does not drift
 
-## Entry Points for Newcomers
+If the CLI, gateway, ACP, and cron each owned their own execution loop, they would drift in tool behavior, prompt rules, fallback logic, and session semantics. Hermes avoids that by pushing real execution down into [`AIAgent`](../entities/agent-loop-runtime.md) and keeping the shells focused on surface concerns such as input, delivery, approvals, and session identity.
 
-For implementation work, the most effective reading order is:
+### Persistence sits close to the runtime because long sessions are normal
 
-1. `website/docs/developer-guide/architecture.md` for the repo-wide map.
-2. `run_agent.py` and [Agent Loop Runtime](../entities/agent-loop-runtime.md) for the actual execution spine.
-3. `agent/prompt_builder.py`, `agent/context_compressor.py`, and [Prompt Assembly System](../entities/prompt-assembly-system.md) to understand how context is constructed and preserved.
-4. `hermes_cli/runtime_provider.py` and [Provider Runtime](../entities/provider-runtime.md) to understand why the same agent can speak to multiple provider families.
-5. `tools/registry.py`, `model_tools.py`, and [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) to see how capabilities reach the model.
-6. `gateway/run.py` and [Gateway Runtime](../entities/gateway-runtime.md) if the work involves messaging surfaces or long-running sessions.
-7. `hermes_state.py` and [Session Storage](../entities/session-storage.md) if the work involves recall, continuity, or compression side effects.
+Hermes assumes users will resume work, compress conversations, search past sessions, and carry context across shells. Because of that, persistence is not an afterthought added at the edge. Systems such as [Session Storage](../entities/session-storage.md) and [Memory and Learning Loop](../entities/memory-and-learning-loop.md) sit close to the runtime path and show up during normal turn handling.
 
-Readers who care about higher-level mechanics rather than a single subsystem should then move into [Self-Improving Agent Architecture](../concepts/self-improving-agent-architecture.md), [Prompt Layering and Cache Stability](../concepts/prompt-layering-and-cache-stability.md), and [Gateway Message to Agent Reply Flow](../syntheses/gateway-message-to-agent-reply-flow.md).
+### Tool access is a product boundary, not just an implementation detail
+
+The model-visible capability surface changes by platform, config, and runtime readiness. That is why Hermes has a distinct [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) layer instead of handing every helper directly to the model. Toolsets, approval transport, and dynamic discovery from MCP or plugins all exist to keep that surface governed.
+
+### Files on disk are part of runtime input, not just configuration
+
+Hermes pulls identity and policy from files such as `SOUL.md`, `HERMES.md`, `AGENTS.md`, and related context files. That decision keeps behavior editable without rewriting Python code, but it also means [Prompt Assembly System](../entities/prompt-assembly-system.md) has to be treated as core runtime machinery rather than a thin prompt helper.
+
+## Reading Paths For Different Readers
+
+Different readers should branch into different pages after this overview.
+
+| If you want to understand... | Start here | Then read |
+|---|---|---|
+| The core execution spine | [Agent Loop Runtime](../entities/agent-loop-runtime.md) | [Prompt Assembly System](../entities/prompt-assembly-system.md), [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) |
+| Messaging and long-running behavior | [Gateway Runtime](../entities/gateway-runtime.md) | [Session Storage](../entities/session-storage.md), [Gateway Message to Agent Reply Flow](../syntheses/gateway-message-to-agent-reply-flow.md) |
+| Why Hermes keeps context across turns | [Session Storage](../entities/session-storage.md) | [Memory and Learning Loop](../entities/memory-and-learning-loop.md), [Prompt Layering and Cache Stability](../concepts/prompt-layering-and-cache-stability.md) |
+| The big-picture design | [Self-Improving Agent Architecture](../concepts/self-improving-agent-architecture.md) | [Codebase Map](codebase-map.md), [Research and Batch Surfaces](../entities/research-and-batch-surfaces.md) |
+
+If you want the shortest practical path, read this page, then [Agent Loop Runtime](../entities/agent-loop-runtime.md), then [Gateway Runtime](../entities/gateway-runtime.md). That sequence gives you the core runtime, the main long-running shell, and the clearest boundary between them.
 
 ## See Also
 
 - [Codebase Map](codebase-map.md)
 - [Agent Loop Runtime](../entities/agent-loop-runtime.md)
 - [Gateway Runtime](../entities/gateway-runtime.md)
+- [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md)
 - [Self-Improving Agent Architecture](../concepts/self-improving-agent-architecture.md)

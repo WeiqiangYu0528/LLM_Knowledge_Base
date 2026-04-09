@@ -2,59 +2,164 @@
 
 ## Overview
 
-The CLI runtime is the primary entry point into OpenCode. It owns command parsing, logging initialization, one-time database migration, environment markers, and the large command surface that exposes account, providers, agent selection, serving, TUI attach/thread flows, ACP, MCP, import/export, and debugging.
+The CLI runtime is the primary entry point for the OpenCode binary. It is implemented in `src/index.ts` and owns the complete lifecycle from process startup through command dispatch to final process exit. The runtime is responsible for constructing the yargs command tree, initializing the logging subsystem, starting heap telemetry, setting process-level environment markers, running one-time JSON-to-SQLite database migration on first launch, and dispatching to one of roughly twenty named commands.
 
-The CLI is where the batteries-included SDK becomes a day-to-day product: config, approvals, sessions, and remote tooling all converge here.
+The CLI is also the sole location where global error handlers for `unhandledRejection` and `uncaughtException` are installed, and where top-level yargs parsing failures are routed to structured error output rather than raw stack traces.
 
-In practice, this page should be read as a boundary explanation, not just a file list. CLI Runtime owns a specific slice of the OpenCode runtime, but it only makes sense in relation to neighboring systems such as [Session System](session-system.md), [Project and Instance System](project-and-instance-system.md), [Request to Session Execution Flow](../syntheses/request-to-session-execution-flow.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
+### Global CLI options (yargs)
 
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `packages/opencode/src/index.ts` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `packages/opencode/src/cli/bootstrap.ts`, `packages/opencode/src/cli/cmd/`, `opencode/package.json` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Root command entry point and startup/migration flow; Project-scoped bootstrap helper; Command implementations across serve, run, ACP, MCP, providers, TUI, and debugging; Workspace scripts and runtime command catalog |
-| Extension or policy points | The main extension or gating surfaces live around `packages/opencode/src/cli/cmd/`. |
-| Persistent effects | state changes and runtime handoffs described in the cited files |
+These options apply to every subcommand and are evaluated in the middleware phase before any command handler runs.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `--print-logs` | `boolean` | Pipes structured log output to stderr in addition to the log file |
+| `--log-level` | `"DEBUG" \| "INFO" \| "WARN" \| "ERROR"` | Overrides default log level (default is `DEBUG` for local/dev installs, `INFO` otherwise) |
+| `--pure` | `boolean` | Sets `OPENCODE_PURE=1` in the environment; suppresses loading of external plugins |
+| `--version` / `-v` | — | Prints `Installation.VERSION` and exits |
+| `--help` / `-h` | — | Renders help via a custom `show()` function that prepends the logo to stderr |
+
+### Installation.Info (from `installation/index.ts`)
+
+```typescript
+// Zod schema: InstallationInfo
+{
+  version: string,   // current binary version (semver)
+  latest:  string,   // latest published version (from remote check)
+}
+```
+
+Additional statics on the `Installation` namespace:
+
+| Export | Value |
+|--------|-------|
+| `Installation.VERSION` | Current semver string sourced from `meta.ts` at build time |
+| `Installation.CHANNEL` | Release channel (`stable`, `beta`, etc.) |
+| `Installation.Method` | Union: `"curl" \| "npm" \| "yarn" \| "pnpm" \| "bun" \| "brew" \| "scoop" \| "choco" \| "unknown"` |
+| `Installation.ReleaseType` | Union: `"patch" \| "minor" \| "major"` |
+| `Installation.isLocal()` | Returns true when the binary is running from a local checkout |
 
 ## Architecture
 
-CLI Runtime is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `packages/opencode/src/index.ts`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+The entry point file (`src/index.ts`) is deliberately thin. It constructs a single yargs instance, attaches one middleware block, registers all commands, and runs. All non-trivial logic lives in the modules imported by each command file under `src/cli/cmd/`.
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+```
+src/index.ts          <-- yargs construction, middleware, error boundary
+  |
+  +-- cli/bootstrap.ts          -- Instance.provide() wrapper for project-scoped commands
+  |
+  +-- cli/cmd/
+  |     run.ts                  -- RunCommand
+  |     generate.ts             -- GenerateCommand
+  |     tui/thread.ts           -- TuiThreadCommand
+  |     tui/attach.ts           -- AttachCommand
+  |     acp.ts                  -- AcpCommand
+  |     mcp.ts                  -- McpCommand
+  |     account.ts              -- ConsoleCommand
+  |     providers.ts            -- ProvidersCommand
+  |     agent.ts                -- AgentCommand
+  |     upgrade.ts              -- UpgradeCommand
+  |     uninstall.ts            -- UninstallCommand
+  |     serve.ts                -- ServeCommand
+  |     web.ts                  -- WebCommand
+  |     models.ts               -- ModelsCommand
+  |     stats.ts                -- StatsCommand
+  |     export.ts               -- ExportCommand
+  |     import.ts               -- ImportCommand
+  |     github.ts               -- GithubCommand
+  |     pr.ts                   -- PrCommand
+  |     session.ts              -- SessionCommand
+  |     plug.ts                 -- PluginCommand
+  |     db.ts                   -- DbCommand
+  |     debug.ts                -- DebugCommand
+  |
+  +-- installation/index.ts     -- VERSION, isLocal(), update events
+  +-- storage/json-migration.ts -- JsonMigration.run() with progress callback
+  +-- storage/db.ts             -- Database.Client() — used during migration check
+  +-- cli/heap.ts               -- Heap.start() telemetry
+  +-- util/log.ts               -- Log.init(), Log.Default, Log.file()
+```
 
-For implementers, the important question is not only what CLI Runtime does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+The `bootstrap()` helper in `cli/bootstrap.ts` is a thin wrapper around `Instance.provide()`. Commands that require a project context (a working directory, loaded config, initialized filesystem) call `bootstrap(directory, async () => { ... })` to ensure `InstanceBootstrap` runs and `Instance.dispose()` is called on exit.
 
 ## Runtime Behavior
 
-1. `src/index.ts` becomes relevant when root command entry point and startup/migration flow.
-2. `cli/bootstrap.ts` becomes relevant when project-scoped bootstrap helper.
-3. `cmd/` becomes relevant when command implementations across serve, run, ACP, MCP, providers, TUI, and debugging.
-4. `opencode/package.json` becomes relevant when workspace scripts and runtime command catalog.
+The following steps happen in order every time the `opencode` binary runs:
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+1. **Global error handlers installed.** Before any argument parsing, `process.on("unhandledRejection")` and `process.on("uncaughtException")` are registered. Both log via `Log.Default.error` and allow execution to continue; fatal errors are caught in the top-level `try/catch`.
 
-## Variants, Boundaries, and Failure Modes
+2. **yargs instance built.** `yargs(hideBin(process.argv))` is called with `.parserConfiguration({ "populate--": true })` so that `--` passthrough arguments are preserved for commands such as `run` that forward flags to subprocesses.
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+3. **`--pure` flag processed first in middleware.** If `--pure` is present, `process.env.OPENCODE_PURE = "1"` is set before any other initialization so that plugin loading code (which runs after this point) can observe the flag.
 
-The main extension and failure surfaces are concentrated around `packages/opencode/src/cli/cmd/`. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+4. **`Log.init()` called.** The log subsystem is initialized with `print`, `dev`, and `level` options derived from global flags and `Installation.isLocal()`. All subsequent log calls are valid after this point.
+
+5. **`Heap.start()` called.** Lightweight heap-size telemetry begins tracking memory usage for diagnostic purposes.
+
+6. **Environment markers set.** Three variables are stamped into `process.env`:
+   - `AGENT=1` — signals to child processes that they are running inside the agent
+   - `OPENCODE=1` — general presence marker
+   - `OPENCODE_PID=<pid>` — allows child processes to locate the parent
+
+7. **First-run database migration check.** The existence of `<Global.Path.data>/opencode.db` is used as a sentinel. If the file is absent, the process is performing its first run and all legacy JSON storage must be migrated to SQLite via `JsonMigration.run(Database.Client().$client, { progress })`.
+
+8. **Progress bar rendered during migration.** When stderr is a TTY, a 36-character block-character progress bar is drawn in orange/muted ANSI colors with the cursor hidden (`\x1b[?25l` / `\x1b[?25h`). Non-TTY environments (e.g., CI, embedded TUI) receive `sqlite-migration:<percent>` newline-separated lines instead, followed by `sqlite-migration:done`.
+
+9. **Command dispatched.** yargs resolves the subcommand and invokes its handler. Most handlers call `bootstrap()` to enter a project context.
+
+10. **Error boundary.** If any command throws, the outer `try/catch` formats the error through `FormatError`, logs it with `Log.Default.error("fatal", ...)`, and writes a human-readable message to stderr via `UI.error()`. Unknown errors include a pointer to `Log.file()`. `process.exitCode = 1` is set but `process.exit()` is always called in `finally` to flush pending I/O and terminate any lingering child processes (particularly MCP servers running in Docker that do not handle SIGTERM).
+
+## Command Reference
+
+| Command export | yargs name (inferred) | Primary purpose |
+|----------------|----------------------|-----------------|
+| `AcpCommand` | `acp` | Agent Control Protocol server |
+| `McpCommand` | `mcp` | Model Context Protocol integration |
+| `TuiThreadCommand` | `thread` | Launch or resume a TUI thread |
+| `AttachCommand` | `attach` | Attach to an existing TUI session |
+| `RunCommand` | `run` | Non-interactive prompt execution |
+| `GenerateCommand` | `generate` | Code generation utility |
+| `DebugCommand` | `debug` | Diagnostics and debug output |
+| `ConsoleCommand` | `account` | Account/console management |
+| `ProvidersCommand` | `providers` | List and configure providers |
+| `AgentCommand` | `agent` | Agent mode entry |
+| `UpgradeCommand` | `upgrade` | Self-update binary |
+| `UninstallCommand` | `uninstall` | Remove OpenCode from system |
+| `ServeCommand` | `serve` | Start HTTP/WebSocket server |
+| `WebCommand` | `web` | Open web UI |
+| `ModelsCommand` | `models` | List available models |
+| `StatsCommand` | `stats` | Usage statistics |
+| `ExportCommand` | `export` | Export sessions/data |
+| `ImportCommand` | `import` | Import sessions/data |
+| `GithubCommand` | `github` | GitHub integration |
+| `PrCommand` | `pr` | Pull request tooling |
+| `SessionCommand` | `session` | Session management |
+| `PluginCommand` | `plugin` | Plugin management |
+| `DbCommand` | `db` | Database inspection/repair |
+
+The `completion` built-in generates shell completion scripts (bash/zsh/fish).
 
 ## Source Files
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/index.ts` | Root command entry point and startup/migration flow |
-| `packages/opencode/src/cli/bootstrap.ts` | Project-scoped bootstrap helper |
-| `packages/opencode/src/cli/cmd/` | Command implementations across serve, run, ACP, MCP, providers, TUI, and debugging |
-| `opencode/package.json` | Workspace scripts and runtime command catalog |
+| File | Key exports / functions |
+|------|------------------------|
+| `src/index.ts` | yargs instance construction, middleware (Log.init, Heap.start, env markers, migration), global error handlers, `show()` help formatter |
+| `src/cli/bootstrap.ts` | `bootstrap(directory, cb)` — wraps `Instance.provide` + `Instance.dispose` |
+| `src/installation/index.ts` | `Installation.VERSION`, `Installation.CHANNEL`, `Installation.isLocal()`, `Installation.getReleaseType()`, `Installation.Info` schema, `Installation.Event.Updated`, `Installation.Event.UpdateAvailable` |
+| `src/storage/json-migration.ts` | `JsonMigration.run(client, { progress })` — migrates legacy JSON flat files to SQLite |
+| `src/storage/db.ts` | `Database.Client()` — DrizzleORM client factory |
+| `src/cli/heap.ts` | `Heap.start()` — heap telemetry |
+| `src/util/log.ts` | `Log.init()`, `Log.Default`, `Log.file()`, `Log.Level` type |
+| `src/cli/ui.ts` | `UI.logo()`, `UI.error()` — CLI output helpers |
+| `src/cli/error.ts` | `FormatError(e)` — converts error objects to user-readable strings |
 
 ## See Also
 
 - [Session System](session-system.md)
 - [Project and Instance System](project-and-instance-system.md)
+- [Provider System](provider-system.md)
+- [Tool System](tool-system.md)
 - [Request to Session Execution Flow](../syntheses/request-to-session-execution-flow.md)
 - [Client Server Agent Architecture](../concepts/client-server-agent-architecture.md)
 - [Architecture Overview](../summaries/architecture-overview.md)
-- [Codebase Map](../summaries/codebase-map.md)

@@ -1,14 +1,41 @@
 # Hermes Agent Architecture Wiki — Index
 
-> Master catalog of the Hermes Agent sub-wiki.
+> Entry guide and master catalog for the Hermes Agent sub-wiki.
 
 | Meta | Value |
 |------|-------|
 | **Pages** | 34 |
-| **Last Updated** | 2026-04-08 |
-| **Last Lint** | 2026-04-08 |
+| **Last Updated** | 2026-04-09 |
+| **Last Lint** | 2026-04-09 |
 
 ---
+
+## What This Wiki Covers
+
+This wiki documents Hermes Agent as a shared runtime platform rather than a single chat interface. The core questions it tries to answer are:
+
+- how Hermes turns one runtime loop into several shells such as CLI, gateway, ACP, and cron
+- how the model-visible capability surface is governed through toolsets, readiness checks, and approval paths
+- how session continuity, memory, recall, and compression make long-running work practical
+
+If you are reading Hermes for the first time, do not start from a random entity page. Start from the hub pages below so you get the runtime shape before you dive into supporting subsystems.
+
+## Recommended Reading Paths
+
+### If You Are New To Hermes
+
+1. [Architecture Overview](summaries/architecture-overview.md) to get the system mental model.
+2. [Agent Loop Runtime](entities/agent-loop-runtime.md) to understand the execution spine.
+3. [Gateway Runtime](entities/gateway-runtime.md) to see how Hermes becomes a long-running message-driven shell.
+4. [Tool Registry and Dispatch](entities/tool-registry-and-dispatch.md) to understand how capabilities reach the model.
+
+### If You Want To Understand The Runtime And Messaging Surfaces
+
+1. [Gateway Runtime](entities/gateway-runtime.md) for shell-level control flow.
+2. [Gateway Message to Agent Reply Flow](syntheses/gateway-message-to-agent-reply-flow.md) for the end-to-end message path.
+3. [Agent Loop Runtime](entities/agent-loop-runtime.md) for turn execution.
+4. [Session Storage](entities/session-storage.md) for continuity and transcript durability.
+5. [Interruption and Human Approval Flow](concepts/interruption-and-human-approval-flow.md) for queued input and dangerous-command handling.
 
 ## Summaries
 

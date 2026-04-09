@@ -2,136 +2,206 @@
 
 ## Overview
 
-`run_agent.py` is the runtime center of Hermes Agent. Its `AIAgent` class owns the synchronous conversation loop that every major surface reuses: CLI chat, gateway message handling, ACP editor sessions, cron-triggered prompts, and batch or evaluation runs. The surrounding packages matter, but the decisive architectural fact is that they mostly prepare inputs for `AIAgent` and interpret its callbacks rather than reimplementing agent execution themselves.
+`AIAgent` in `run_agent.py` is the execution core that turns a user turn into a completed assistant turn. Hermes has several shells around it, including the [CLI Runtime](cli-runtime.md), the [Gateway Runtime](gateway-runtime.md), ACP editor sessions, cron entrypoints, and batch flows, but those shells mostly prepare inputs and consume outputs. They do not reimplement the actual model-and-tool loop.
 
-That makes this page the hub for the rest of the Hermes wiki. If a behavior affects retries, tool calling, compression, fallback provider selection, memory flushes, or interruption, the implementation usually lives either directly in `run_agent.py` or in a collaborator that `AIAgent` calls at a specific point in the loop.
+That is why this page is a hub page. If you want to understand where Hermes builds prompts, switches providers, decides to compress history, intercepts agent-local tools, persists session state, or recovers from failures, you usually end up back at `AIAgent.run_conversation()`.
 
-## Key Types
+The most useful mental model is this:
 
-| Type or method | Role |
-|------|------|
-| `IterationBudget` in `run_agent.py` | Shared turn-budget object used by parent and child agents |
-| `AIAgent` in `run_agent.py` | Core runtime object wrapping model calls, tool execution, callbacks, persistence, and fallback |
-| `AIAgent.run_conversation()` | Full entry point returning messages, metadata, and usage data |
-| `AIAgent.chat()` | Thin convenience wrapper that extracts the final response string |
-| `AIAgent._try_activate_fallback()` | One-shot model/provider failover path |
-| `MemoryManager` integration | Hooks built-in and external memory behavior into each turn |
+- shells own transport, routing, UI, approvals, and session orchestration
+- `AIAgent` owns turn execution
+- adjacent subsystems plug into specific points inside that turn execution
 
-Representative runtime signatures:
+Read this page as a runtime handbook, not just a class summary. The important question is not only "what does `AIAgent` do?" but "in what order does it do it, and where do other Hermes subsystems enter that order?"
+
+## What `AIAgent` Owns
+
+`AIAgent` owns the invariants of a single conversational turn. Once a shell has chosen the session, gathered history, and instantiated the runtime, `AIAgent` is responsible for keeping the rest of the turn coherent.
+
+In practice that means it owns:
+
+- the canonical internal message history format used across providers
+- the turn loop in `run_conversation()`, including repeated model calls after tool results
+- system-prompt caching and rebuilds after compression events
+- API-mode selection and normalization for chat completions, Codex Responses, and Anthropic Messages
+- interrupt-aware model calls, retries, and provider fallback activation
+- tool execution, including both normal registry dispatch and agent-intercepted tools
+- turn-local callbacks for progress, thinking, reasoning, streaming, and status
+- token accounting, compression triggers, and end-of-turn persistence
+
+It does not own everything around the conversation. It does not decide which inbound message to process next, how a Telegram or Discord event gets authorized, how terminal UI widgets render, or how a gateway session is paired and routed. Those belong to outer shells such as [Gateway Runtime](gateway-runtime.md), [CLI Runtime](cli-runtime.md), and [Messaging Platform Adapters](messaging-platform-adapters.md).
+
+## Key Types And Runtime Anchors
+
+The file is large, but a small set of methods and collaborators explain most of the runtime.
+
+| Anchor | Kind | Collaborators | Why it matters |
+| --- | --- | --- | --- |
+| `IterationBudget` | Type | child agents, budget warnings | Counts loop iterations and lets the runtime decide when to warn or force wrap-up. |
+| `AIAgent.__init__()` | Constructor | provider setup, callbacks, memory manager, tool surface | Establishes the runtime's long-lived state: API mode, tool schemas, session DB, memory providers, callbacks, compression settings, and prompt-cache behavior. |
+| `AIAgent._build_system_prompt()` | Method | [`agent/prompt_builder.py`](prompt-assembly-system.md), memory stores, skills index | Builds the stable system prompt snapshot that Hermes tries to reuse across turns for cache stability. |
+| `AIAgent.run_conversation()` | Method | provider clients, plugin hooks, tool dispatch, persistence | The real runtime entry point. It appends the user turn, runs the model/tool loop, and returns the completed result object. |
+| `AIAgent._invoke_tool()` | Method | [`model_tools.py`](tool-registry-and-dispatch.md), memory manager, agent-local tool handlers | Shows the split between registry-dispatched tools and tools the loop intercepts itself. |
+| `AIAgent._execute_tool_calls()` | Method | thread pool, approval path, callbacks | Runs single or batched tool calls, preserves ordering, and decides when concurrency is safe. |
+| `AIAgent._compress_context()` | Method | [`agent/context_compressor.py`](../concepts/prompt-layering-and-cache-stability.md), memory flush, session DB | Performs compaction, rebuilds the system prompt, and creates a continuation session lineage in SQLite. |
+| `AIAgent._try_activate_fallback()` | Method | provider router, credentials, client rebuild | Swaps model, provider, client, and API mode in place when Hermes needs to fail over. |
+| `AIAgent.chat()` | Method | `run_conversation()` | Convenience wrapper for surfaces that only need the final text instead of the full result dict. |
+
+Two signatures define the public runtime surface:
 
 ```python
 class AIAgent:
     def run_conversation(
         self,
         user_message: str,
-        system_message=None,
-        conversation_history=None,
-        task_id=None,
-    ) -> dict: ...
+        system_message: str = None,
+        conversation_history: List[Dict[str, Any]] = None,
+        task_id: str = None,
+        stream_callback: Optional[callable] = None,
+        persist_user_message: Optional[str] = None,
+    ) -> Dict[str, Any]: ...
 
-    def chat(self, message: str, stream_callback=None) -> str: ...
+    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str: ...
 ```
 
-The `chat()` method exists for ergonomic callers. The real runtime behavior is in `run_conversation()`, which appends the new user message, builds the effective prompt, issues provider calls, loops on tool results, persists state, and returns a rich result dict.
+The important distinction is that `chat()` is ergonomic, but `run_conversation()` is architectural. All of Hermes's serious runtime behavior lives there.
 
-## Architecture
+## Lifecycle Of `run_conversation()`
 
-`AIAgent` is not a monolithic "do everything inline" loop even though the file is large. It delegates several responsibilities outward:
+The loop is easiest to understand as an ordered pipeline.
 
-- prompt construction to `agent/prompt_builder.py`
-- compression decisions and summary generation to `agent/context_compressor.py`
-- Anthropic prompt caching behavior to `agent/prompt_caching.py`
-- provider/model metadata and auxiliary client behavior to `agent/model_metadata.py` and `agent/auxiliary_client.py`
-- tool schema discovery and normal registry dispatch to `model_tools.py` and `tools/registry.py`
-- persistent memory and provider-specific recall to `agent/memory_manager.py`
-- session persistence to `hermes_state.py`
+1. **Restore and sanitize turn state.** The method restores the primary runtime if the previous turn used a fallback provider, sanitizes invalid surrogate characters, stores the streaming callback, creates a fresh task ID when needed, and resets retry counters.
 
-The runtime still keeps several capabilities in-file because they need agent-local state that general tools do not have. The docs call these "agent-level tools": `todo`, `memory`, `session_search`, and `delegate_task`. Their schemas are visible to the model, but the loop intercepts them before the normal registry path because they need access to the current agent state, budget, or session machinery.
+2. **Reset per-turn execution budget.** `run_conversation()` creates a fresh `IterationBudget` for the top-level turn and clears stale budget-pressure text from loaded history so old warnings do not poison future turns.
 
-The result is a layered architecture:
+3. **Load and normalize conversation state.** The incoming history is copied, not mutated in place. If the gateway created a fresh `AIAgent` for this message, the loop can hydrate agent-local TODO state back out of prior tool results.
 
-1. `AIAgent` owns the turn loop and global invariants.
-2. Collaborator modules own prompt shaping, provider details, and subsystem-specific helpers.
-3. Tool modules own actual capability execution.
-4. Surface shells such as CLI or gateway own transport, presentation, and approval UX.
+4. **Append the new user message.** The current user turn becomes the new tail of the internal OpenAI-style history. Hermes keeps this canonical message format even when the active provider is Anthropic or Codex Responses.
 
-## Runtime Behavior
+5. **Reuse or build the system prompt.** If the session already has a stored system prompt snapshot in SQLite, the loop reuses it. Otherwise it builds one from scratch through `prompt_builder.py`, memory blocks, skills indexing, context files, identity text, date metadata, and platform hints. This is where [Prompt Assembly System](prompt-assembly-system.md) enters the loop.
 
-### Core turn lifecycle
+6. **Run preflight compression if the loaded history is already too large.** Before making any model call, the loop estimates request size including tool schemas. If the session is already over the compressor threshold, `_compress_context()` summarizes older turns, flushes memory, rebuilds the system prompt, and may split the SQLite session into a continuation lineage.
 
-The implementation described in `website/docs/developer-guide/agent-loop.md` matches the code layout in `run_agent.py`:
+7. **Collect ephemeral per-turn context.** Plugin `pre_llm_call` hooks can add context for this turn, and external memory providers can prefetch recall text. Importantly, this extra context is injected into the API-facing user message, not into the stored system prompt, so Hermes preserves prompt-cache stability across turns. This behavior is central to [Prompt Layering And Cache Stability](../concepts/prompt-layering-and-cache-stability.md).
 
-1. Generate or accept a `task_id`.
-2. Append the incoming user message to conversation history.
-3. Build or reuse the cached system prompt.
-4. Check context pressure and run preflight compression if needed.
-5. Format messages for the current `api_mode`.
-6. Apply ephemeral overlays such as budget warnings or gateway-specific additions.
-7. Make the provider call through an interrupt-aware wrapper.
-8. Parse the result.
-9. If there are tool calls, execute them and loop.
-10. If there is a final response, persist messages, flush memory if needed, and return.
+8. **Enter the tool-capable model loop.** Each loop iteration consumes budget, fires `step_callback` for surfaces that track progress, and builds `api_messages` from the persisted history plus ephemeral overlays:
+   - current-turn memory/provider recall
+   - plugin-injected user context
+   - ephemeral system prompt additions
+   - optional prefill messages
+   - Anthropic cache-control markers
+   - sanitization of tool-call structure for strict providers
 
-This flow is what keeps CLI, gateway, and ACP behavior aligned. The caller can change callbacks, session history, or working directory, but it still ends up traversing the same turn machine.
+9. **Make an interrupt-aware provider call.** The runtime prefers the streaming path even when no UI is visibly streaming, because streaming gives it better health checks and stale-connection detection. Provider-specific formatting and parsing differences are pushed to the edges, but `AIAgent` still owns the decision to call the correct transport and normalize the result back into one internal shape. This is where [Provider Runtime](provider-runtime.md) enters.
 
-### API-mode branching
+10. **Account for usage and handle transport failures.** On success, the loop updates token counts, cost estimates, prompt-cache stats, and session DB counters. On failure, it decides whether to retry, refresh credentials, compress context, treat a disconnect as a context overflow, or activate fallback.
 
-Hermes supports three API transport shapes:
+11. **If the model returned tool calls, execute them and continue.** The assistant tool-call message is appended to history, the loop dispatches the tools, appends ordered tool results, optionally refunds cheap `execute_code` iterations, may emit user-facing context-pressure warnings, and may trigger post-tool compression before the next model call.
 
-- `chat_completions`
-- `codex_responses`
-- `anthropic_messages`
+12. **If the model returned a final answer, close the turn.** The loop appends the final assistant message, strips user-facing `<think>` blocks, persists the session, fires plugin post-turn hooks, syncs external memory providers, schedules best-effort background memory or skill review, and returns the full result dict.
 
-The provider runtime chooses which one is active, but `AIAgent` has to normalize them back to one internal message format. Internally Hermes stores OpenAI-style `role` / `content` / `tool_calls` dicts. That means transport-specific differences are mostly pushed to the edges: formatting input before the call and translating output afterward.
+That sequence is why Hermes shells stay consistent. The gateway, CLI, and ACP surfaces can differ a lot in transport and presentation, but once they hand control to `run_conversation()`, they traverse the same runtime machine.
 
-### Tool execution and concurrency
+## Where Adjacent Subsystems Enter The Loop
 
-Tool results can be executed either sequentially or concurrently:
+The runtime is not monolithic. It is a coordinator with several collaborators that enter at distinct points.
 
-- one tool call: execute inline
-- multiple tool calls: execute through `ThreadPoolExecutor`
-- interactive or approval-sensitive tools can force sequential behavior
+| Subsystem | Where it enters | What it contributes |
+| --- | --- | --- |
+| [`agent/prompt_builder.py`](prompt-assembly-system.md) | system-prompt build or rebuild | Identity text, tool-aware guidance, skills snapshot, context-file loading, timestamp lines, and platform hints. |
+| [`model_tools.py`](tool-registry-and-dispatch.md) and `tools/registry.py` | tool-surface setup and normal dispatch | The model-visible tool schema set and the default `handle_function_call()` path for ordinary tools. |
+| [`agent/context_compressor.py`](../syntheses/compression-memory-and-session-search-loop.md) | preflight compression, post-tool compression, overflow recovery | Prunes old tool results, protects the head and tail of history, generates structured summaries, and repairs tool-call pairings after compaction. |
+| `agent.memory_manager` and memory-provider plugins | prompt build, prefetch, tool interception, post-turn sync | Adds memory-provider prompt blocks, per-turn recall context, provider-owned tool calls, and post-response sync/prefetch work. |
+| [`hermes_state.py`](session-storage.md) | session start, per-call accounting, end-of-turn persistence, session search | Stores the system prompt snapshot, appends messages, restores replayable history, maintains FTS-backed search, and records compression lineages through `parent_session_id`. |
+| plugin hooks | session start, pre-LLM, pre-request, post-turn, session end | Let plugins attach context or observe runtime events without owning the loop itself. |
+| shell callbacks | throughout the loop | `tool_progress_callback`, `thinking_callback`, `reasoning_callback`, `clarify_callback`, `step_callback`, `stream_delta_callback`, and `status_callback` let shells render progress without changing loop semantics. |
 
-Results are reinserted in the original tool-call order even if they complete out of order. This matters because the model relies on consistent tool-result ordering when continuing the loop.
+Two integration details are easy to miss:
 
-### Callback surfaces
+First, prompt assembly is intentionally split between stable and ephemeral layers. Stable content goes into the cached system prompt. Ephemeral content, including recall text and plugin turn context, is kept out of that snapshot and injected later. This keeps cache behavior predictable instead of rebuilding the whole prompt every turn.
 
-`AIAgent` exposes several callback hooks so surfaces can present runtime progress without changing the loop:
+Second, persistence is not just an end-of-turn afterthought. Session storage shapes the loop in several places: it can provide the prior system prompt for cache reuse, replay messages in provider-compatible form, power `session_search`, and record compression continuations as a parent-child session chain. That is why [Session Storage](session-storage.md) is adjacent to the loop rather than merely downstream from it.
 
-| Callback | Typical use |
-|------|------|
-| `tool_progress_callback` | CLI spinners, gateway progress notices, ACP tool updates |
-| `thinking_callback` | User-facing "thinking" status |
-| `reasoning_callback` | Display or stream model reasoning content |
-| `clarify_callback` | Surface-specific prompt for human clarification |
-| `step_callback` | Progress tracking per full turn |
-| `stream_delta_callback` | Streaming token display |
-| `status_callback` | ACP or gateway state transitions |
+## Special-Case Tool Paths
 
-### Budgets, fallback, and compression
+Most Hermes tools follow the normal route: the model emits a tool call, `AIAgent` hands it to `handle_function_call()`, and the registry locates the concrete implementation. That default path is documented in [Tool Registry And Dispatch](tool-registry-and-dispatch.md).
 
-The loop keeps three important safety mechanisms in the same runtime owner:
+Some tools do not take that route. `AIAgent` intercepts them before normal registry dispatch because they need direct access to agent-local state, current callbacks, or runtime-only collaborators.
 
-- **Iteration budget:** `IterationBudget` warns at roughly 70 percent and 90 percent usage and eventually forces wrap-up.
-- **Fallback provider activation:** `_try_activate_fallback()` can swap provider, model, base URL, API mode, and client in place when the primary runtime fails.
-- **Compression:** older turns may be summarized once context pressure crosses configured thresholds, with tool-call groups preserved and memory flushed first.
+| Tool path | Owner inside the loop | Why it bypasses normal registry dispatch |
+| --- | --- | --- |
+| `todo` | `self._todo_store` | TODO state is agent-local, may need hydration from session history, and is frequently injected back into compressed context. |
+| `session_search` | `self._session_db` | It queries the agent's current session database and needs the active session ID to avoid blind global search. |
+| `memory` | built-in memory store plus memory-provider bridge | Built-in memory writes update on-disk memory files and also notify external memory providers when appropriate. |
+| memory-provider tools | `self._memory_manager` | Provider plugins can expose extra tools that are not part of the static core registry. |
+| `clarify` | `clarify_callback` from the shell | The tool is interactive by definition, so the loop must hand control back to the shell that can actually ask the human. |
+| `delegate_task` | parent `AIAgent` | Delegation needs the live parent agent so child agents inherit runtime context, toolsets, and interruption behavior. |
 
-These are not separate subsystems accidentally touching the loop; they are central correctness mechanisms for long-running agents.
+This split matters because it shows that not every "tool" in Hermes is just a registry entry. Some are really loop extensions that happen to be model-visible as tool schemas.
+
+That also explains the shell boundary. A shell owns the human interaction channel needed by `clarify`, but it does not own the logic that decides when `clarify` was called, how that result is inserted into history, or how the loop resumes afterward. The loop owns that.
+
+## Budgets, Fallback, Compression, And Failure Handling
+
+These mechanisms are not side features. They are part of the runtime contract.
+
+**Iteration budgets.** The loop checks budget on every model iteration, not only at the end. Budget pressure is communicated back to the model by appending warnings to tool-result content instead of inserting new standalone messages that could break role alternation or invalidate cache assumptions. If the turn exhausts its budget, `_handle_max_iterations()` produces a forced wrap-up path.
+
+**Fallback activation.** `_try_activate_fallback()` does more than swap a model string. It rebuilds the provider client, updates `provider`, `model`, `base_url`, and `api_mode`, and re-evaluates whether prompt caching should stay enabled. Fallback can trigger after malformed responses, rate limiting, quota issues, or non-recoverable client errors, depending on which recovery paths have already been tried.
+
+**Compression.** The compressor works in phases rather than brute-force truncation:
+
+1. prune old tool-result payloads when they are large and no longer recent
+2. protect the conversation head
+3. protect the tail by token budget rather than fixed message count
+4. summarize the middle into a structured handoff
+5. sanitize tool-call pairs so the replayed history still satisfies provider rules
+
+Compression also has side effects outside the message list. Before compaction, the loop flushes memory so durable facts are not lost. After compaction, it invalidates and rebuilds the system prompt, clears file-read dedup state, and may create a new SQLite session whose `parent_session_id` points at the pre-compression session.
+
+**Failure handling.** `run_conversation()` has a deliberately layered recovery model:
+
+- sanitize and retry once for surrogate-character encoding failures
+- refresh credentials for provider-specific auth failures when possible
+- interpret some 400/413/429/server-disconnect cases as context-overflow signals and compress instead of aborting
+- fall back to alternate providers when retries are not likely to help
+- preserve message-structure invariants by filling missing tool results on exception paths
+
+The result is that long-running Hermes sessions can degrade gracefully instead of turning a single provider hiccup into a broken conversation transcript.
+
+## Ownership Boundaries
+
+The cleanest way to read Hermes is to separate shell ownership from loop ownership.
+
+| Owner | Owns | Does not own |
+| --- | --- | --- |
+| Shells such as [CLI Runtime](cli-runtime.md), [Gateway Runtime](gateway-runtime.md), ACP, cron, and batch entrypoints | inbound transport, session selection, authorization, routing, UI rendering, approval UX, platform delivery, callback wiring, working-directory or platform setup | model/tool execution semantics, provider retry policy, compression timing, tool-result ordering, final transcript structure |
+| `AIAgent` and `run_conversation()` | turn execution, prompt reuse and rebuild, provider-call loop, tool execution, interrupts, fallback, budget checks, per-turn persistence, end-of-turn sync hooks | gateway pairing, terminal layout, platform delivery semantics, session expiry policy, long-lived message queues |
+| Adjacent subsystems such as [Prompt Assembly System](prompt-assembly-system.md), [Tool Registry And Dispatch](tool-registry-and-dispatch.md), [Session Storage](session-storage.md), and [Memory And Learning Loop](memory-and-learning-loop.md) | specialized services that the loop calls at defined points | overall conversational control flow |
+
+The most important boundary to state explicitly is this: shells prepare for the loop, but they do not own the loop.
+
+They choose when to call `run_conversation()`, which history to pass in, which callbacks to attach, and how to present intermediate status. Once the call starts, `AIAgent` owns message ordering, tool execution order, provider normalization, retry behavior, fallback activation, compression, and persistence.
+
+That boundary is what lets Hermes have many shells without fragmenting into many agent runtimes.
 
 ## Source Files
 
-| File | Purpose |
-|------|---------|
-| `run_agent.py` | `IterationBudget`, `AIAgent`, fallback activation, tool loop, callbacks, compression hooks |
-| `website/docs/developer-guide/agent-loop.md` | Maintainer-level description of the turn lifecycle and callback surfaces |
-| `agent/context_compressor.py` | In-loop compression algorithm used by the agent runtime |
-| `agent/prompt_builder.py` | System prompt assembly used before model calls |
-| `model_tools.py` | Tool discovery and normal dispatch bridge |
-| `hermes_state.py` | Session persistence used at turn boundaries |
+| File | Why it matters for this page |
+| --- | --- |
+| `hermes-agent/run_agent.py` | Defines `IterationBudget`, `AIAgent`, the tool loop, fallback activation, callbacks, compression entrypoints, and end-of-turn persistence. |
+| `hermes-agent/website/docs/developer-guide/agent-loop.md` | Maintainer-facing walkthrough of the same loop, including API modes, callbacks, intercepted tools, and compression behavior. |
+| `hermes-agent/agent/prompt_builder.py` | Builds the stable system-prompt layers and explains why prompt assembly is partly cache-oriented. |
+| `hermes-agent/agent/context_compressor.py` | Implements structured compaction, tail protection, iterative summary updates, and tool-pair repair after compression. |
+| `hermes-agent/hermes_state.py` | Provides session creation, prompt snapshot storage, message persistence, FTS-backed search, and parent-child session lineage. |
 
 ## See Also
 
+- [Architecture Overview](../summaries/architecture-overview.md)
 - [Prompt Assembly System](prompt-assembly-system.md)
 - [Provider Runtime](provider-runtime.md)
-- [Tool Registry and Dispatch](tool-registry-and-dispatch.md)
-- [Gateway Message to Agent Reply Flow](../syntheses/gateway-message-to-agent-reply-flow.md)
+- [Tool Registry And Dispatch](tool-registry-and-dispatch.md)
+- [Session Storage](session-storage.md)
+- [Memory And Learning Loop](memory-and-learning-loop.md)
+- [Compression, Memory, And Session Search Loop](../syntheses/compression-memory-and-session-search-loop.md)
+- [CLI To Agent Loop Composition](../syntheses/cli-to-agent-loop-composition.md)

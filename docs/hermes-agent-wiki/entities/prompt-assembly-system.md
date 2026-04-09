@@ -2,106 +2,162 @@
 
 ## Overview
 
-Hermes treats prompt assembly as a first-class subsystem because it is where identity, memory, project context, skills, and surface-specific behavior all converge. The key design choice is the separation between a stable cached prompt prefix and ephemeral, API-call-time additions. That separation is what allows Hermes to benefit from Anthropic prompt caching, keep stable identity and memory layers across turns, and avoid mutating the prompt prefix every time a transient runtime condition changes.
+Prompt assembly is the subsystem that turns Hermes's identity, memory, skills, project context, and surface hints into the system prompt seen by the model. Its main job is not "building one long string." Its job is deciding which context should stay stable for an entire session and which context should stay ephemeral at API-call time.
 
-## Key Types / Key Concepts
+That split matters because Hermes tries to keep the stored system prompt stable across turns. Stable prompt state is easier to cache, easier to reason about, and less likely to drift when plugins, shells, or memory providers add turn-specific context.
 
-| Function or concept | Role |
-|------|------|
-| `load_soul_md()` in `agent/prompt_builder.py` | Loads `SOUL.md` from `HERMES_HOME` as the agent identity layer |
-| `build_context_files_prompt()` in `agent/prompt_builder.py` | Resolves project context files using a priority order |
-| `DEFAULT_AGENT_IDENTITY` | Fallback identity when `SOUL.md` is absent |
-| frozen memory snapshot | Built-in memory and user-profile layers injected into the cached prompt |
-| ephemeral system prompt | Per-call overlay that is intentionally excluded from the cached prefix |
+The clean mental model is:
 
-Representative signatures:
+- prompt assembly owns the stable prompt layers and their order
+- the agent loop owns when that prompt is built, reused, or invalidated
+- shells can supply overlays, but they do not become prompt owners
 
-```python
-def load_soul_md() -> Optional[str]: ...
-def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str: ...
-```
+## What Prompt Assembly Owns
 
-## Architecture
+Prompt assembly owns the contents of Hermes's stable system prompt. In practice that means:
 
-The prompt system is centered in `agent/prompt_builder.py`, but it draws data from several other owners:
+- choosing the identity layer, including `SOUL.md` fallback behavior
+- adding tool-aware guidance blocks when the relevant tools are available
+- freezing built-in memory and user-profile snapshots into the prompt
+- building the compact skills index
+- loading project context files from disk with explicit priority rules
+- adding stable session metadata such as start time, optional session ID, model, provider, and platform hint
+- sanitizing and truncating file-based prompt input before it is injected
 
-- `hermes_cli/config.py` and runtime config for optional system-message layers
-- memory files and the `MemoryManager` for built-in memory snapshots
-- `tools/skills_tool.py` and skill-loading surfaces for skill indexes
-- project files in the current working directory such as `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, or Cursor rule files
-- `agent/prompt_caching.py` for cache breakpoint markers on Anthropic paths
+It does not own every piece of context the model sees. It does not decide when to rebuild the prompt, when to compress history, or how plugins inject per-turn recall. Those decisions belong to [`AIAgent`](agent-loop-runtime.md) in `run_agent.py`.
 
-The important ownership line is that prompt assembly decides *what* becomes stable prompt state, while the agent loop decides *when* to rebuild it.
+## Stable Vs Ephemeral Prompt Layers
 
-## Runtime Behavior
+The most important boundary in this subsystem is the one between stable layers and ephemeral overlays.
 
-### Stable prompt layers
+| Layer type | Typical contents | Where it comes from | Why it lives there |
+| --- | --- | --- | --- |
+| Stable system prompt | identity, tool guidance, frozen memory, skills index, project context, timestamp, platform hint | `run_agent.py` + `agent/prompt_builder.py` | Reused across turns and stored in SQLite so the prefix stays predictable and cacheable |
+| Ephemeral system overlay | `ephemeral_system_prompt`, shell-specific formatting nudges | `AIAgent` runtime args | Changes too often to belong in the stored prompt |
+| Ephemeral user-message overlay | plugin `pre_llm_call` context, external memory-provider recall | plugin hooks and `MemoryManager` | Keeps turn-specific context available without mutating the stable prefix |
+| Ephemeral prefill messages | provider- or workflow-specific seeded messages | runtime config and call-site setup | Useful for one call or one turn, but not part of Hermes's persistent identity |
 
-The developer guide lays out the cached prompt layers in roughly this order:
+Hermes treats the stable prompt as session state. It treats the ephemeral layers as call-time state.
 
-1. agent identity from `SOUL.md` or `DEFAULT_AGENT_IDENTITY`
-2. tool-aware behavior guidance
-3. optional Honcho static block
-4. optional system message
-5. frozen persistent memory snapshot
-6. frozen user profile snapshot
-7. skills index
-8. project context files
-9. timestamp and optional session ID
-10. platform hint
+## How The Stable Prompt Is Assembled
 
-This order matters. Identity comes first because it defines the agent persona. Memory and user profile follow because they should behave like stable background facts. Project context is later because it depends on the active working directory. Platform hints come last because they are surface-specific framing rather than core identity.
+`AIAgent._build_system_prompt()` in `run_agent.py` is the runtime entry point, but most of the assembly logic lives in `agent/prompt_builder.py`. The layers are appended in a deliberate order:
 
-### Context-file priority
+1. **Identity first.** Hermes loads `SOUL.md` from `HERMES_HOME` through `load_soul_md()`. If no `SOUL.md` exists, it falls back to `DEFAULT_AGENT_IDENTITY`.
+2. **Tool-aware guidance next.** Memory, session-search, and skill guidance only appear when those tools are actually available. Model-family-specific execution guidance can also be added here.
+3. **Optional stable system message.** A caller can provide `system_message`, and Hermes treats it as part of the stored prompt snapshot rather than a transient overlay.
+4. **Frozen memory blocks.** Built-in memory and `USER.md` profile data are formatted once and appended as prompt background.
+5. **External memory-provider system block.** Providers can add stable system-prompt material through `MemoryManager.build_system_prompt()`.
+6. **Skills index.** `build_skills_system_prompt()` adds a compact index of available skills, filtered by tools, toolsets, and platform.
+7. **Filesystem context.** `build_context_files_prompt()` loads project instruction files from disk using priority rules described below.
+8. **Stable metadata.** Hermes appends the conversation start time, optional session ID, selected model, provider, and finally a platform hint such as CLI or messaging-surface guidance.
 
-`build_context_files_prompt()` does not merge every supported project-context format. It uses a first-match-wins priority:
+This order gives Hermes a stable teaching shape. Identity and core behavior come first. Background memory and skills come next. Project-specific instructions follow. Session metadata and surface hints come last because they frame the conversation instead of defining the agent's core persona.
 
-1. `.hermes.md` or `HERMES.md`
-2. `AGENTS.md`
-3. `CLAUDE.md`
-4. `.cursorrules` or `.cursor/rules/*.mdc`
+## Filesystem And Runtime Sources
 
-That design prevents conflicting instruction files from all being loaded at once. It also means Hermes can remain compatible with several agent ecosystems while still preferring its own project-native context format when present.
+Prompt assembly draws from both the filesystem and the live runtime, but it does not treat them the same way.
 
-### SOUL.md and duplicate suppression
+### Filesystem sources
 
-`SOUL.md` is treated specially. When it is loaded as the identity layer, `build_context_files_prompt()` is called with `skip_soul=True` so the same file is not injected again as generic project context. This prevents duplicated persona text and stabilizes the cached prefix.
+The filesystem sources are the durable instruction layers:
 
-### Security and truncation
+- `SOUL.md` in `HERMES_HOME` for agent identity
+- `.hermes.md` or `HERMES.md` for Hermes-native project context
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.cursorrules` and `.cursor/rules/*.mdc`
 
-Prompt input from files is not trusted blindly. The prompt builder:
+`build_context_files_prompt()` uses first-match-wins ordering for project context:
 
-- scans for prompt-injection-like patterns
-- strips YAML frontmatter from `.hermes.md`
-- truncates oversized context files
-- keeps `SOUL.md` and project context under explicit size limits
+1. `.hermes.md` or `HERMES.md` walking upward toward the git root
+2. `AGENTS.md` in the current working directory
+3. `CLAUDE.md` in the current working directory
+4. Cursor rule files in the current working directory
 
-The point is not strong sandbox security; it is keeping file-based prompt inputs legible, bounded, and less vulnerable to obvious instruction poisoning.
+That rule is important. Hermes does not try to merge every instruction file it can find. It chooses one project-context family so the prompt does not accumulate conflicting copies of local policy.
 
-### Ephemeral overlays
+`SOUL.md` is independent of that project-context search. It normally occupies the identity slot. When Hermes has already loaded it there, `build_context_files_prompt(skip_soul=True)` prevents the same content from being injected a second time as generic project context.
 
-Certain layers are intentionally excluded from the cached prefix:
+### Runtime sources
+
+The runtime sources are the layers that come from the current session or calling surface:
+
+- the optional `system_message`
+- frozen memory snapshots from the current memory store
+- external memory-provider prompt blocks
+- the skill index filtered by currently visible tools and toolsets
+- session ID, model, provider, and platform values
+- `TERMINAL_CWD`, which lets gateway sessions resolve context files from the user's real working directory instead of the gateway process directory
+
+This distinction is useful when reading the code. Filesystem sources usually explain *what instructions Hermes follows*. Runtime sources usually explain *which version of those instructions applies in this session*.
+
+## Why Some Context Stays Outside The Stored System Prompt
+
+Hermes is deliberately conservative about what enters the stored system prompt.
+
+The agent loop caches the built prompt on `self._cached_system_prompt`, stores that snapshot in SQLite, and reuses the exact stored prompt when a later turn continues the same session. That is not just an optimization. It preserves prompt-cache stability, especially for Anthropic-style caching where the system prompt is one of the cache breakpoints.
+
+`agent/prompt_caching.py` applies cache markers to:
+
+- the system prompt
+- the last three non-system messages
+
+That strategy only helps if the system prompt stays stable. If plugins, gateway state, or recall text rewrote the system prompt on every turn, the expensive prefix would churn and cache reuse would collapse.
+
+That is why several context sources are injected outside the stored prompt:
 
 - `ephemeral_system_prompt`
-- per-turn budget warnings
-- gateway session overlays
-- later-turn dynamic recall content
+- plugin `pre_llm_call` context
+- external memory-provider prefetch results
 - prefill messages
 
-Those pieces vary too often. If they were merged into the stable prefix, prompt caching would be less effective and previously cached prefixes would churn every turn.
+`run_agent.py` injects plugin context and external recall into the current user message instead of the system prompt. It appends `ephemeral_system_prompt` only at API-call time. Both choices protect the stable prefix while still giving the model turn-specific context.
+
+The same logic explains frozen memory snapshots. Mid-session memory writes can update disk state, but Hermes does not keep mutating the already-built prompt after every write. The prompt is rebuilt on a new session or after invalidation events such as context compression.
+
+## Cache-Stability Goals
+
+The prompt system is optimized around a few clear goals:
+
+- keep the session's main instruction prefix identical across turns whenever possible
+- avoid re-reading and reformatting stable context on every model call
+- preserve provider-side prompt caching benefits
+- make stored sessions reproducible enough that continued turns behave like true continuations instead of fresh prompt rebuilds
+- let high-churn context arrive at runtime without poisoning the stable prefix
+
+This is also why the subsystem contains its own micro-caching for the skills layer. `build_skills_system_prompt()` keeps an in-process LRU cache and a disk snapshot so Hermes does not have to rescan every skill file just to rebuild the same stable skills index.
+
+## Shell Boundary: Who Owns What
+
+Shells are allowed to contribute context, but they are not allowed to redefine prompt ownership.
+
+| Owner | Owns | Does not own |
+| --- | --- | --- |
+| Prompt assembly | stable prompt layers, ordering, context-file priority, sanitization, truncation, skill-index construction | transport-specific delivery, per-turn plugin context, approval UX, conversation-loop timing |
+| Agent loop | when the prompt is built, reused, stored, invalidated, or combined with ephemeral overlays | filesystem discovery rules or stable-layer ordering |
+| Shells such as CLI or gateway | providing `system_message`, `ephemeral_system_prompt`, `platform`, `session_id`, and working-directory hints | redefining the stable prompt contract or bypassing prompt assembly's ordering rules |
+
+The key boundary is simple: shells may supply overlays, but Hermes keeps ownership of the actual system prompt contract inside the runtime. That prevents each surface from growing its own prompt dialect.
+
+## Guardrails On File-Based Prompt Input
+
+File-based prompt content is treated as useful but untrusted input.
+
+`prompt_builder.py` scans `SOUL.md` and project context files for obvious prompt-injection patterns, strips YAML frontmatter from `.hermes.md`, and truncates oversized content with a head-and-tail strategy. The goal is not full security isolation. The goal is to keep disk-sourced prompt material bounded, readable, and less likely to smuggle low-quality instructions into the stable prompt.
 
 ## Source Files
 
-| File | Purpose |
-|------|---------|
-| `agent/prompt_builder.py` | Core prompt assembly, `SOUL.md` loading, context-file priority, sanitization |
-| `agent/prompt_caching.py` | Anthropic cache-marker handling for stable prefixes |
-| `website/docs/developer-guide/prompt-assembly.md` | Maintainer documentation for the cached vs ephemeral split |
-| `tools/memory_tool.py` | Built-in memory write/read behavior that influences memory snapshots |
-| `run_agent.py` | Rebuild timing and injection of ephemeral overlays |
+| File | Why it matters |
+| --- | --- |
+| `hermes-agent/agent/prompt_builder.py` | Defines identity loading, context-file discovery, file sanitization, truncation, skill-index building, and most stable prompt-layer helpers. |
+| `hermes-agent/run_agent.py` | Calls `_build_system_prompt()`, caches the result per session, stores it in SQLite, and injects ephemeral overlays at API-call time. |
+| `hermes-agent/agent/prompt_caching.py` | Implements the Anthropic cache-marker strategy that depends on a stable system prompt prefix. |
+| `hermes-agent/website/docs/developer-guide/prompt-assembly.md` | Maintainer-facing explanation of the stable-vs-ephemeral split and the intended layer order. |
 
 ## See Also
 
+- [Architecture Overview](../summaries/architecture-overview.md)
 - [Agent Loop Runtime](agent-loop-runtime.md)
 - [Memory and Learning Loop](memory-and-learning-loop.md)
 - [Prompt Layering and Cache Stability](../concepts/prompt-layering-and-cache-stability.md)

@@ -2,55 +2,140 @@
 
 ## Overview
 
-Beyond the main CLI and app surfaces, OpenCode ships or supports several additional clients and shells: desktop packages, Slack integration, a VS Code SDK surface, and related packaging surfaces. These packages make the repo a product platform rather than only a terminal app.
+OpenCode's server-owns-state architecture makes it straightforward to graft additional client shells on top of the same HTTP/SSE API. Beyond the built-in terminal UI and browser surfaces, the monorepo ships four external client categories: two native desktop wrappers (Tauri and Electron), a Slack bot integration, and a JavaScript SDK that underpins all of them. A Zed editor extension and the `opencode acp` command round out the editor-integration story.
 
-Desktop and remote clients show how far the core runtime can be reused without changing its internal execution model.
+None of these clients embed their own agent loop. Each one discovers a running OpenCode server (or spawns one as a sidecar), then drives it through the same REST API and SSE event bus that the TUI and web clients use. The design principle is the same as for local surfaces: the server is the single source of truth; clients are renderers or bridges.
 
-In practice, this page should be read as a boundary explanation, not just a file list. Desktop and Remote Clients owns a specific slice of the OpenCode runtime, but it only makes sense in relation to neighboring systems such as [UI Client Surfaces](ui-client-surfaces.md), [Control Plane and Workspaces](control-plane-and-workspaces.md), [Client Server Agent Architecture](../concepts/client-server-agent-architecture.md). The source-file map below shows where that ownership begins, where it is delegated, and where policy or state crosses into other modules.
+## Key Types
 
-## Key Types / Key Concepts
-
-| Dimension | Notes |
-| --- | --- |
-| Primary center of gravity | `packages/desktop/package.json and README.md` is the best first file when you need to confirm the runtime shape of this subsystem. |
-| Supporting modules | `packages/desktop-electron/package.json and README.md`, `packages/slack/package.json and README.md`, `packages/sdk/js/` refine the boundary by handling adjacent concerns rather than duplicating the primary entry point. |
-| Runtime concerns | Tauri desktop shell; Electron desktop shell; Slack integration package; JavaScript SDK package |
-| Extension or policy points | The main extension or gating surfaces live around the neighboring modules listed in the source map. |
-| Persistent effects | Tauri desktop shell; Electron desktop shell |
+| Symbol | Package / File | Role |
+|---|---|---|
+| `spawnLocalServer` | `desktop-electron/src/main/server.ts` | Spawns the `opencode serve` CLI as a child process sidecar; polls health endpoint until ready |
+| `getDefaultServerUrl` / `setDefaultServerUrl` | `desktop-electron/src/main/server.ts` | Persists a remote server URL in Electron's store so the user can reconnect across restarts |
+| `AcpCommand` | `opencode/src/cli/cmd/acp.ts` | Starts an embedded server, then bridges Agent Client Protocol messages between stdin/stdout and the REST API |
+| `AgentSideConnection` | `@agentclientprotocol/sdk` | ACP library type: wraps an ndjson stream into a structured agent session |
+| `createOpencode` | `sdk/js/src/index.ts` | Convenience factory: starts an embedded server and returns a typed client bound to it |
+| `createOpencodeClient` | `sdk/js/src/client.ts` | Typed HTTP client (generated from OpenAPI); adds directory-header injection and disables fetch timeout |
+| `createOpencodeServer` | `sdk/js/src/server.ts` | SDK-level server spawner; accepts `{ port }` and returns `{ url }` |
+| Slack `App` | `slack/src/index.ts` | Bolt framework instance; handles `app_mention` and `message` events, one OpenCode session per thread |
 
 ## Architecture
 
-Desktop and Remote Clients is organized around a clear center-of-gravity module and a ring of support files. The primary entry point is `packages/desktop/package.json and README.md`, which anchors the control flow and makes the main decisions about this subsystem. The surrounding modules exist because the subsystem has to balance orchestration with policy, transport, UI, or persistence concerns rather than collapsing all behavior into one file.
+### Tauri desktop app (`packages/desktop`)
 
-Reading the source map from top to bottom usually reconstructs the intended design. Early files define the public or orchestration surface, mid-level files handle execution mechanics, and later files tend to encode policy, adapters, or stateful helpers. That split is deliberate: it keeps the subsystem usable from the rest of the repo while leaving enough internal structure to swap providers, backends, policies, or UI-specific glue without rewriting the core logic.
+The Tauri package wraps the `packages/app` web frontend in a native window using the Tauri v2 framework (Rust backend + WebKit webview). The Rust layer (`src-tauri/src/`) manages OS-specific concerns: display backend selection on Linux (X11 vs Wayland via `linux_windowing.rs`), window chrome customisation, and markdown rendering. The web frontend loads the same bundle served by the HTTP server; for development, Vite runs on `http://localhost:1420`.
 
-For implementers, the important question is not only what Desktop and Remote Clients does, but what it does not own. Neighboring entity and concept pages explain the adjacent responsibilities, especially where configuration, approval, persistence, routing, or remote execution hand off across boundaries. The runtime usually stays coherent because this subsystem keeps its contract narrow even when the source tree around it is large.
+The Tauri shell does not start or stop the OpenCode server itself — that responsibility belongs to the Electron shell or to the user running `opencode serve` separately. The Tauri binary is the primary distribution artifact for macOS and Linux native app bundles.
+
+Build command: `bun run --cwd packages/desktop tauri build`
+Dev command: `bun run --cwd packages/desktop tauri dev`
+
+### Electron desktop app (`packages/desktop-electron`)
+
+The Electron shell is more feature-complete than the Tauri variant as a standalone product: it manages the full lifecycle of the OpenCode server as a sidecar process. Key responsibilities handled in `src/main/`:
+
+- **Server lifecycle** (`server.ts`): `spawnLocalServer(hostname, port, password)` invokes the `opencode serve` CLI binary as a child process with `CommandChild` (a thin wrapper over Electron's `utilityProcess` or spawn). It then polls `GET /health` every 100 ms until the process responds or exits. The resolved URL is stored with `setDefaultServerUrl` so the renderer can reconnect after a crash.
+- **Remote server support**: `getDefaultServerUrl` / `setDefaultServerUrl` persist a URL in Electron's persistent key-value store. Users can point the app at a remote server (e.g. a cloud VM) without changing code; the renderer simply fetches from that URL.
+- **Auto-update** (`index.ts`): `electron-updater` watches for new releases (`autoUpdater`) and can apply them in the background.
+- **IPC** (`ipc.ts`): Contextual bridges (preload → main) expose `sendDeepLinks`, `sendMenuCommand`, and `sendSqliteMigrationProgress` to the renderer process.
+- **WSL support**: The `WslConfig` store entry enables a mode where the sidecar is launched inside WSL2 rather than directly on Windows, allowing the server to access Linux file paths.
+
+The Electron app supports three channels (`dev`, `beta`, `prod`) distinguished by `APP_IDS` and `APP_NAMES` constants; channel selection is baked in at build time.
+
+### ACP command — editor agent protocol (`packages/opencode`)
+
+```
+opencode acp [--port N] [--cwd PATH]
+```
+
+`AcpCommand` implements the Agent Client Protocol (ACP), a structured ndjson-over-stdio protocol used by editors to communicate with an agent. The handler:
+
+1. Sets `process.env.OPENCODE_CLIENT = "acp"` to signal the server that this is an editor-driven session.
+2. Starts an embedded OpenCode server with `Server.listen`.
+3. Creates a typed SDK client pointed at the local server.
+4. Wraps `process.stdin` and `process.stdout` into Web Streams.
+5. Passes those streams to `ndJsonStream` and hands the result to `AgentSideConnection`, which drives the ACP session lifecycle.
+
+The Zed extension (`packages/extensions/zed/extension.toml`) is the primary consumer of this command. Its `extension.toml` declares an `[agent_servers.opencode]` section that downloads the correct platform binary and invokes it with `args = ["acp"]`. The extension works on macOS ARM/x86, Linux ARM/x86, and Windows x86.
+
+Other editors can integrate via the same pattern: spawn `opencode acp`, communicate via ndjson on stdio.
+
+### Slack integration (`packages/slack`)
+
+The Slack package is a standalone bot process, not embedded in the main binary. It uses Bolt's Socket Mode (WebSocket to Slack's infrastructure, avoiding a public inbound webhook).
+
+Architecture:
+
+1. A single `createOpencode({ port: 0 })` call (from `@opencode-ai/sdk`) starts an embedded server and returns a bound client.
+2. A global SSE listener subscribes to `event.subscribe()` and forwards `message.part.updated` events (specifically completed tool calls) as threaded Slack messages.
+3. On each incoming Slack message or mention, the bot looks up or creates a `sessions` map entry keyed by `channel + thread_ts`. Each thread gets its own OpenCode session ID, so conversations are isolated.
+4. Tool execution updates are echoed back to the thread as `*toolName* - title` messages.
+
+Required environment variables: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`.
+Required OAuth scopes: `chat:write`, `app_mentions:read`, `channels:history`, `groups:history`.
+
+### JavaScript SDK (`packages/sdk/js`)
+
+The SDK package (`@opencode-ai/sdk`) is the programmatic interface for all external consumers — the Slack bot, the Electron shell's renderer, the ACP command, and third-party integrations.
+
+Key exports:
+
+- `createOpencodeClient(config?)` — builds a fully typed HTTP client from the generated OpenAPI spec (`gen/`). It injects an `x-opencode-directory` header so a single server can serve multiple working directories, and it disables fetch timeouts (important for long-running agent calls).
+- `createOpencodeServer(options?)` — spawns an embedded server and returns its URL. Accepts `{ port: 0 }` to bind on an OS-assigned port.
+- `createOpencode(options?)` — convenience combinator: calls both of the above and returns `{ client, server }`.
+
+The `v2/` subdirectory contains a newer generation of types and client code that the TUI and ACP commands import directly. The `gen/` directory contains machine-generated types from `openapi.json` at the SDK root.
+
+### Enterprise package (`packages/enterprise`)
+
+The `enterprise` package is a SolidStart application (SolidJS SSR framework). Based on its source layout (`src/routes/`, `src/core/`), it provides a hosted control-plane UI — likely the web dashboard for team or enterprise accounts. It is a separate deployment target from the embedded web client in `packages/app` and does not run locally as part of the standard `opencode` binary.
 
 ## Runtime Behavior
 
-1. `desktop/package.json and README.md` becomes relevant when tauri desktop shell.
-2. `desktop-electron/package.json and README.md` becomes relevant when electron desktop shell.
-3. `slack/package.json and README.md` becomes relevant when slack integration package.
-4. `js/` becomes relevant when javaScript SDK package.
-5. `vscode/README.md` becomes relevant when vS Code SDK/client surface.
+### How each client discovers the server
 
-The ordered path above is where most debugging and extension work should start. If behavior differs from expectations, begin with the first stage that decides policy or state, then walk outward into the linked modules. That approach is more reliable than searching by feature name because the repo often composes behavior across several small files rather than one large implementation.
+| Client | Discovery mechanism |
+|---|---|
+| TUI (local) | Server URL comes from the in-process worker RPC bridge; no external lookup needed |
+| TUI (remote attach) | User supplies URL explicitly: `opencode attach http://host:port` |
+| Electron app | `getDefaultServerUrl()` reads persisted store; falls back to spawning a local sidecar via `spawnLocalServer` |
+| Tauri app | Expects server to be reachable at a known URL; does not manage server lifecycle |
+| Slack bot | `createOpencode({ port: 0 })` binds locally; all sessions share one server instance |
+| SDK consumers | Caller provides `baseUrl` to `createOpencodeClient`, or calls `createOpencode` for a self-contained setup |
+| Zed extension | Spawns `opencode acp`; no URL negotiation needed — communication is over stdio |
 
-## Variants, Boundaries, and Failure Modes
+### Authentication
 
-This subsystem has meaningful boundaries with the pages linked in See Also. Those links are not ornamental: they identify where model configuration, UI concerns, plugin or protocol loading, routing, approvals, or persistence leave the local code path and become shared runtime behavior. When you need to change behavior safely, check those boundaries first.
+The server optionally requires HTTP Basic Auth. The username is `opencode` (or the value of `OPENCODE_SERVER_USERNAME`); the password is `OPENCODE_SERVER_PASSWORD`. Clients pass the credential as `Authorization: Basic <base64>`. The Electron app passes the password when spawning the sidecar (`spawnLocalServer(hostname, port, password)`) and the `AttachCommand` does the same when connecting remotely. Requests without credentials are accepted when no password is configured, but the server prints a warning.
 
-The main extension and failure surfaces are concentrated around the neighboring modules listed in the source map. Files with names related to config, hooks, trust, auth, providers, remote execution, or policy usually encode the rules that prevent the subsystem from behaving like a standalone utility. That is why repository-level changes often need both an entity-page update here and a concept or synthesis update elsewhere: the code is modular, but the guarantees are cross-cutting.
+### Remote workspace scenario
+
+A typical remote-server workflow:
+
+1. Run `opencode serve --hostname 0.0.0.0 --port 4096` on the remote machine. Set `OPENCODE_SERVER_PASSWORD` to a strong secret.
+2. From a local terminal: `opencode attach http://<remote-ip>:4096 --password <secret> --dir /path/on/remote`.
+3. The local TUI renders as normal; all agent execution happens on the remote machine.
+
+The Electron desktop app supports the same flow: set the stored server URL to the remote address and the renderer will connect without spawning a local sidecar.
 
 ## Source Files
 
 | File | Purpose |
-| --- | --- |
-| `packages/desktop/package.json and README.md` | Tauri desktop shell |
-| `packages/desktop-electron/package.json and README.md` | Electron desktop shell |
-| `packages/slack/package.json and README.md` | Slack integration package |
-| `packages/sdk/js/` | JavaScript SDK package |
-| `sdks/vscode/README.md` | VS Code SDK/client surface |
+|---|---|
+| `packages/opencode/src/cli/cmd/acp.ts` | `AcpCommand`: ACP stdio bridge |
+| `packages/opencode/src/cli/cmd/tui/attach.ts` | `AttachCommand`: remote TUI attach |
+| `packages/desktop/src-tauri/src/` | Rust backend for the Tauri native app |
+| `packages/desktop/package.json` | Tauri desktop build configuration |
+| `packages/desktop-electron/src/main/index.ts` | Electron main process entry point |
+| `packages/desktop-electron/src/main/server.ts` | Sidecar spawn, health polling, URL persistence |
+| `packages/desktop-electron/src/main/ipc.ts` | Preload-to-main IPC handler registration |
+| `packages/slack/src/index.ts` | Slack bot: Bolt app setup, session map, SSE relay |
+| `packages/slack/README.md` | Slack app credentials and setup instructions |
+| `packages/sdk/js/src/index.ts` | `createOpencode`, `createOpencodeClient`, `createOpencodeServer` |
+| `packages/sdk/js/src/client.ts` | Typed HTTP client with directory header injection |
+| `packages/sdk/js/openapi.json` | OpenAPI spec that drives SDK type generation |
+| `packages/extensions/zed/extension.toml` | Zed extension manifest: downloads binary, invokes `opencode acp` |
+| `packages/enterprise/src/` | SolidStart enterprise dashboard application |
 
 ## See Also
 
