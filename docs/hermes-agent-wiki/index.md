@@ -4,9 +4,9 @@
 
 | Meta | Value |
 |------|-------|
-| **Pages** | 34 |
-| **Last Updated** | 2026-04-09 |
-| **Last Lint** | 2026-04-09 |
+| **Pages** | 35 |
+| **Last Updated** | 2026-04-10 |
+| **Last Lint** | 2026-04-10 |
 
 ---
 
@@ -17,6 +17,8 @@ This wiki documents Hermes Agent as a shared runtime platform rather than a sing
 - how Hermes turns one runtime loop into several shells such as CLI, gateway, ACP, and cron
 - how the model-visible capability surface is governed through toolsets, readiness checks, and approval paths
 - how session continuity, memory, recall, and compression make long-running work practical
+
+The current version of this wiki was rewritten to be read like an implementation handbook instead of a thin catalog. The hub pages explain how Hermes actually behaves at runtime, the supporting pages make the surrounding systems legible, and the synthesis pages reconnect the pieces into end-to-end flows.
 
 If you are reading Hermes for the first time, do not start from a random entity page. Start from the hub pages below so you get the runtime shape before you dive into supporting subsystems.
 
@@ -36,6 +38,13 @@ If you are reading Hermes for the first time, do not start from a random entity 
 3. [Agent Loop Runtime](entities/agent-loop-runtime.md) for turn execution.
 4. [Session Storage](entities/session-storage.md) for continuity and transcript durability.
 5. [Interruption and Human Approval Flow](concepts/interruption-and-human-approval-flow.md) for queued input and dangerous-command handling.
+
+### If You Want To Understand Memory, Compression, And Long-Running Behavior
+
+1. [Memory and Learning Loop](entities/memory-and-learning-loop.md) for the full recall stack.
+2. [Cross-Session Recall and Memory Provider Pluggability](concepts/cross-session-recall-and-memory-provider-pluggability.md) for how built-in search and external providers combine.
+3. [Compression Memory and Session Search Loop](syntheses/compression-memory-and-session-search-loop.md) for the end-to-end continuity story.
+4. [Prompt Layering and Cache Stability](concepts/prompt-layering-and-cache-stability.md) for the prompt-budget consequences of that design.
 
 ## Summaries
 

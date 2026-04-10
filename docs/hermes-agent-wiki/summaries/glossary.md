@@ -1,46 +1,167 @@
 # Hermes Agent Glossary
 
-> Stable vocabulary used across the Hermes Agent runtime, docs, and wiki pages.
-
 ## Overview
 
-Hermes mixes product-facing language, filesystem conventions, and runtime-specific terms. This glossary normalizes the most important ones so the rest of the wiki can stay implementation-led without re-explaining every term from scratch.
+The hardest part of reading Hermes is learning which words are runtime terms, which words are user-facing product language, and which words sound similar but mean different things depending on the subsystem.
 
-## Terms
+This glossary does not try to define every noun in the repo. It focuses on Hermes-specific vocabulary newcomers will keep tripping over while reading the entity and synthesis pages.
 
-| Term | Meaning in Hermes | Primary page |
-|------|-------------------|--------------|
-| `HERMES_HOME` | The profile-scoped home directory containing `config.yaml`, `.env`, `SOUL.md`, logs, skills, memories, cron state, and session data | [Config and Profile System](../entities/config-and-profile-system.md) |
-| `SOUL.md` | The agent identity file loaded as the first prompt layer when present | [Prompt Assembly System](../entities/prompt-assembly-system.md) |
-| `toolset` | A named bundle of tools exposed to a session, often tied to a product surface such as `hermes-cli` or `hermes-acp` | [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md) |
-| `api_mode` | The transport shape used for model calls: `chat_completions`, `codex_responses`, or `anthropic_messages` | [Provider Runtime](../entities/provider-runtime.md) |
-| `session lineage` | Parent-child relationship between sessions, typically created when context compression forks a new child session | [Session Storage](../entities/session-storage.md) |
-| `gateway session key` | Deterministic routing key such as `agent:main:telegram:private:12345` used to isolate messaging conversations | [Gateway Runtime](../entities/gateway-runtime.md) |
-| `pairing` | Gateway-side authorization flow that lets an existing authorized user approve a new messaging user | [Gateway Runtime](../entities/gateway-runtime.md) |
-| `Honcho` | A specific external memory-provider ecosystem with its own tools, identity concepts, and migration path | [Memory and Learning Loop](../entities/memory-and-learning-loop.md) |
-| `ACP` | Agent Client Protocol; Hermes uses it to expose editor-integrated sessions over JSON-RPC stdio | [ACP Adapter](../entities/acp-adapter.md) |
-| `context compression` | Summarization and pruning of older turns when a conversation grows too large for the model context window | [Agent Loop Runtime](../entities/agent-loop-runtime.md) |
-| `gateway hygiene compression` | Pre-agent compression pass in the gateway that keeps dormant long-lived messaging sessions from overrunning context | [Compression Memory and Session Search Loop](../syntheses/compression-memory-and-session-search-loop.md) |
-| `prefetch` | Memory-provider recall step that injects background context before an API call | [Memory and Learning Loop](../entities/memory-and-learning-loop.md) |
-| `session_search` | A tool and runtime path for querying past sessions from the SQLite store | [Memory and Learning Loop](../entities/memory-and-learning-loop.md) |
-| `skill` | Instructional capability packaged as a directory with `SKILL.md` and optional helpers | [Skills System](../entities/skills-system.md) |
-| `optional skill` | Official but not automatically installed skill distributed under `optional-skills/` | [Skills System](../entities/skills-system.md) |
-| `memory provider` | An implementation of `MemoryProvider` that augments built-in memory with an external backend | [Plugin and Memory Provider System](../entities/plugin-and-memory-provider-system.md) |
-| `running-agent guard` | Gateway logic that queues or interrupts incoming messages when a session is already executing | [Gateway Message to Agent Reply Flow](../syntheses/gateway-message-to-agent-reply-flow.md) |
-| `approval callback` | Surface-specific mechanism for handling dangerous terminal or tool actions that require user approval | [Interruption and Human Approval Flow](../concepts/interruption-and-human-approval-flow.md) |
-| `ToolContext` | Research/eval helper that exposes the same sandbox state the model used during rollout | [Research and Batch Surfaces](../entities/research-and-batch-surfaces.md) |
+The big mental model is simple:
 
-## Operational Notes
+- Hermes has one shared agent runtime.
+- Several product surfaces host that runtime: CLI, gateway, cron, ACP, and research or eval shells.
+- Tools, skills, memory, plugins, and execution environments extend what the runtime can do, but they are not interchangeable terms.
 
-Several terms are overloaded across the repo:
+If you keep those three layers separate, most of the vocabulary stops being slippery.
 
-- `memory` can mean the built-in `MEMORY.md` file, the external memory-provider ecosystem, or the user-facing memory tool. The relevant meaning depends on whether the page is discussing prompt assembly, storage, or tool routing.
-- `plugin` can mean the general CLI plugin system or the separate `plugins/memory/` provider family. The latter is repo-bundled and gated to one active external provider at a time.
-- `session` can refer to a CLI conversation, a gateway thread, an ACP editor session, or a cron-run ephemeral session. The runtime keeps them related through shared storage rather than by making them literally the same process object.
+## The Distinctions That Matter Most
+
+Before the term clusters, it helps to pin down the pairs that are easiest to confuse.
+
+| Confusing pair | What the first term means | What the second term means |
+| --- | --- | --- |
+| `tool` vs `skill` | A callable capability Hermes can execute, usually implemented in Python and exposed through the tool registry | A reusable instruction bundle that tells the model how to approach a kind of task |
+| `memory` vs `skill` | Durable facts, preferences, recalled context, or provider-backed knowledge that change what Hermes remembers | Procedural know-how: reusable "how to do this" guidance that changes how Hermes works |
+| `provider` vs `model` | The backend family or endpoint Hermes talks to, such as OpenRouter, Anthropic, or a custom OpenAI-compatible host | The specific model slug routed through that provider |
+| `origin` vs `delivery target` | The platform/chat/thread a job or action came from | The place Hermes should send the result now; this may match the origin or be somewhere else |
+| `gateway session` vs `CLI session` | A conversation keyed by messaging-platform routing state | A conversation started from the terminal UI and stored in session DB without gateway routing keys |
+| `ordinary session` vs `cron session` | A user-driven conversation with history continuity | A fresh isolated scheduled run launched by cron, even if the result is later delivered back to a chat |
+| `plugin` vs `memory provider` | The broader extension mechanism for adding behavior or integrations | A specialized plugin family that supplies one external memory backend at a time |
+
+If the rest of the glossary does one job well, it should make those lines feel stable.
+
+## Runtime And Session Terms
+
+### `AIAgent`
+
+This is the shared execution core in `run_agent.py`. When a wiki page says "the agent loop," it usually means the runtime behavior owned here: prompt building, provider calls, tool execution, retries, compression, and persistence.
+
+### `session`
+
+In Hermes, `session` is a storage and continuity term, not just "whatever process is running right now." A session usually means one conversation thread tracked in session storage. The exact meaning depends on the hosting surface.
+
+- A CLI session is the conversation you started from the terminal UI.
+- A gateway session is the conversation keyed by platform routing, such as a Telegram DM or a Discord thread.
+- A cron session is a fresh scheduled run with its own session ID and isolated execution rules.
+- An ACP session is an editor-integrated conversation hosted through the ACP adapter.
+
+These are related through shared storage and runtime machinery, but not literally the same object.
+
+### `gateway session key`
+
+This is the deterministic routing key the gateway uses to map inbound platform messages onto the correct conversation.
+
+### `HERMES_HOME`
+
+This is the profile-scoped home directory where Hermes keeps runtime state such as `config.yaml`, `.env`, `SOUL.md`, memory files, installed skills, and cron state.
+
+## Capability Terms
+
+### `tool`
+
+A tool is a callable operation visible to the model, usually registered through the tool registry in `tools/`. Tools are the execution side of Hermes.
+
+When a page talks about tool governance, it usually means registration, surface exposure through toolsets, or approval checks before execution.
+
+### `toolset`
+
+A toolset is a named bundle of tools exposed together. Hermes uses toolsets to keep surfaces coherent across surfaces.
+
+### `skill`
+
+A skill is not executable code in the same sense as a tool. It is a directory-centered instruction package whose `SKILL.md` teaches the model how to handle a kind of task.
+
+The most important runtime distinction is this: tools are capabilities Hermes can call; skills are procedures that tell the model how to use capabilities well.
+
+### `optional skill`
+
+This means an official skill distributed in `optional-skills/` but not seeded into the working catalog automatically.
+
+## Memory And Learning Terms
+
+### `memory`
+
+In Hermes, `memory` is overloaded. It can mean built-in file-backed memory such as `MEMORY.md` and `USER.md`, recalled context injected for a turn, the `memory` tool, or the broader learning loop that preserves useful knowledge across sessions.
+
+### `prefetch`
+
+This is the provider-backed recall step that happens before a model call. It is turn-specific recall, not stable always-on prompt content.
+
+### `session_search`
+
+This is Hermes's bridge from stored session transcripts back into the live turn. It feels memory-like, but it is not the same thing as an external memory provider.
+
+### `Honcho`
+
+Honcho is not a generic word for memory in Hermes. It is one specific external memory-provider ecosystem that Hermes can integrate with.
+
+### `learning loop`
+
+This is the broader pattern in which Hermes not only answers the current turn, but also preserves useful things for later turns. Memory writes, recall, review passes, and skill creation all feed into this loop.
+
+## Provider And Runtime Routing Terms
+
+### `provider`
+
+A provider is the backend family or endpoint Hermes resolves before a turn starts. Providers own transport rules, credential lookup, and `api_mode` selection.
+
+### `model`
+
+A model is the specific model identifier routed through the chosen provider. The important point is that Hermes does not treat provider and model as the same choice. A model switch may leave the provider unchanged, and a provider switch may force a different transport even if the model name looks similar.
+
+### `api_mode`
+
+This is the transport shape Hermes must use after provider resolution. The common modes are `chat_completions`, `codex_responses`, and `anthropic_messages`.
+
+## Automation And Delivery Terms
+
+### `origin`
+
+Origin means "where this came from." In cron and some messaging-related flows, that usually means the platform, chat, and optional thread or topic that created the job or request.
+
+### `delivery target`
+
+Delivery target means "where the result should go now." It may be the stored origin, a configured home channel, an explicit platform target, or no platform at all if the result is local-only.
+
+Users often assume "send it back there" and "it came from there" are always identical. Hermes keeps them related, but not synonymous.
+
+### `cron job`
+
+A cron job is a stored automation contract: prompt, schedule, optional skills, optional script, and delivery metadata. It is not a long-lived background conversation.
+
+### `cron session`
+
+This is the fresh isolated session Hermes creates when a cron job becomes due. A cron delivery may arrive in an ordinary chat, but the execution itself did not happen inside that ordinary conversation.
+
+## Extension And Integration Terms
+
+### `plugin`
+
+In the broad Hermes sense, a plugin is an extension mechanism that can add behavior, integrations, or provider-style capabilities.
+
+### `memory provider`
+
+A memory provider is a narrower term: one external backend that plugs into the memory and learning loop.
+
+### `ACP`
+
+ACP means Agent Client Protocol. In Hermes, it is the editor-facing transport that lets tools such as VS Code, Zed, or JetBrains talk to Hermes over a structured session bridge.
+
+### `execution environment`
+
+This refers to the backend abstraction used for command execution, such as local, Docker, SSH, Daytona, Singularity, or Modal.
+
+## Reading Advice
+
+If a term feels vague while reading Hermes docs, first ask which layer you are in: shared runtime, hosting surface, or capability layer. Most confusion comes from mixing those layers. "Session" changes between storage, gateway routing, and cron execution. "Memory" changes between prompt assembly, recall, and provider plugins. "Skill" and "tool" often appear together because they cooperate, not because they are the same thing.
 
 ## See Also
 
 - [Architecture Overview](architecture-overview.md)
-- [Config and Profile System](../entities/config-and-profile-system.md)
+- [Codebase Map](codebase-map.md)
+- [Tool Registry and Dispatch](../entities/tool-registry-and-dispatch.md)
 - [Skills System](../entities/skills-system.md)
+- [Memory and Learning Loop](../entities/memory-and-learning-loop.md)
+- [Gateway Runtime](../entities/gateway-runtime.md)
+- [Cron System](../entities/cron-system.md)
 - [Multi-Surface Session Continuity](../concepts/multi-surface-session-continuity.md)
