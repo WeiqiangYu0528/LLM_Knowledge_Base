@@ -92,7 +92,9 @@ document.addEventListener("DOMContentLoaded", function () {
   // chatHistory holds the full conversation as [{role, content}] pairs.
   // It is appended to only after a complete round-trip (user msg + agent reply).
   let chatHistory = [];
-  const BACKEND_URL = "https://wiki-backend.duckdns.org";
+  const BACKEND_URL = window.location.hostname === "localhost"
+    ? "http://localhost:8001"
+    : "https://wiki-backend.duckdns.org";
 
   // --- TOGGLE LOGIC ---
   let isExpanded = false;
