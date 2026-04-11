@@ -285,3 +285,11 @@ exclude_docs: |
   claude_code/
   .obsidian/
   tools-wiki/
+
+extra_css:
+  - stylesheets/chatbox.css
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/marked/marked.min.js
+
+  - javascripts/chatbox.js
