@@ -92,7 +92,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // chatHistory holds the full conversation as [{role, content}] pairs.
   // It is appended to only after a complete round-trip (user msg + agent reply).
   let chatHistory = [];
-  const BACKEND_URL = "http://localhost:8001";
+  const BACKEND_URL = "http://34.171.146.152:8001";
 
   // --- TOGGLE LOGIC ---
   let isExpanded = false;
